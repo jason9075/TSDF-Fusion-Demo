@@ -51,27 +51,23 @@ const DEPTH_RES = 48; // must match worker.js
  * @param {'sphere'|'torus'} type
  */
 function createGaussianCloud(type, N = params.gaussianCount) {
-    // Low-poly sphere as the base ellipsoid shape
     const geo = new THREE.SphereGeometry(1, 5, 4);
     const mat = new THREE.MeshBasicMaterial({
         transparent: true,
         opacity: 0.40,
         depthWrite: false,
-        // Additive blending makes dense overlapping regions brighter,
-        // matching the appearance of Gaussian splats in a real renderer.
         blending: THREE.AdditiveBlending,
     });
 
     const cloud = new THREE.InstancedMesh(geo, mat, N);
-
     const dummy = new THREE.Object3D();
     const color = new THREE.Color();
     const yAxis = new THREE.Vector3(0, 1, 0);
     const normal = new THREE.Vector3();
 
     for (let i = 0; i < N; i++) {
+        // --- Sample base surface position & normal ---
         let x, y, z, nx, ny, nz;
-
         if (type === 'sphere') {
             const phi   = Math.random() * Math.PI * 2;
             const theta = Math.acos(2 * Math.random() - 1);
@@ -91,36 +87,76 @@ function createGaussianCloud(type, N = params.gaussianCount) {
             nz = Math.sin(theta);
         }
 
-        // Small position jitter to simulate imperfect 3DGS reconstruction
-        x += (Math.random() - 0.5) * 0.06;
-        y += (Math.random() - 0.5) * 0.06;
-        z += (Math.random() - 0.5) * 0.06;
+        const baseHue = (Math.atan2(nz, nx) / (Math.PI * 2) + 0.5 + ny * 0.15) % 1.0;
 
-        // Anisotropic scale: flat in normal dir (thin), wide tangentially
-        const tang = 0.05 + Math.random() * 0.10;
-        const norm = 0.015 + Math.random() * 0.025;
+        // --- Artifact type (probabilities tuned to look like real 3DGS) ---
+        const roll = Math.random();
+        let sx, sy, sz, hue, sat, lig;
+
+        if (roll < 0.08) {
+            // Floater — drifts off the surface, common near object boundaries
+            const drift = 0.2 + Math.random() * 0.6;
+            x += nx * drift + (Math.random() - 0.5) * 0.25;
+            y += ny * drift + (Math.random() - 0.5) * 0.25;
+            z += nz * drift + (Math.random() - 0.5) * 0.25;
+            // Nearly isotropic (no preferred orientation in open space)
+            sx = sz = 0.025 + Math.random() * 0.05;
+            sy = 0.025 + Math.random() * 0.05;
+            hue = Math.random(); // arbitrary color
+            sat = 0.25; lig = 0.20 + Math.random() * 0.12; // dim
+
+        } else if (roll < 0.18) {
+            // Needle — very elongated in one tangential direction.
+            // Appears on thin structures, occluding edges, or bad-angle views.
+            x += (Math.random() - 0.5) * 0.04;
+            y += (Math.random() - 0.5) * 0.04;
+            z += (Math.random() - 0.5) * 0.04;
+            sx = 0.18 + Math.random() * 0.18; // long tangential axis
+            sy = 0.006 + Math.random() * 0.006; // thin normal axis
+            sz = 0.008 + Math.random() * 0.01;  // thin other tangential
+            hue = baseHue;
+            sat = 0.55; lig = 0.35 + Math.random() * 0.2;
+
+        } else if (roll < 0.25) {
+            // Oversized blob — large Gaussian covering a uniform region.
+            // Common on flat surfaces or sky backgrounds.
+            x += (Math.random() - 0.5) * 0.05;
+            y += (Math.random() - 0.5) * 0.05;
+            z += (Math.random() - 0.5) * 0.05;
+            sx = 0.14 + Math.random() * 0.14;
+            sy = 0.05 + Math.random() * 0.05;
+            sz = 0.14 + Math.random() * 0.14;
+            hue = (baseHue + 0.04) % 1.0;
+            sat = 0.35; lig = 0.25 + Math.random() * 0.12; // dim large blob
+
+        } else {
+            // Normal surface Gaussian — flat, asymmetric tangential ellipsoid.
+            // sx ≠ sz to capture the real anisotropy seen in 3DGS.
+            x += (Math.random() - 0.5) * 0.06;
+            y += (Math.random() - 0.5) * 0.06;
+            z += (Math.random() - 0.5) * 0.06;
+            sx = 0.05 + Math.random() * 0.10;
+            sy = 0.012 + Math.random() * 0.022;
+            sz = 0.03  + Math.random() * 0.08; // different from sx
+            hue = baseHue;
+            sat = 0.65 + Math.random() * 0.25;
+            lig = 0.55 + Math.random() * 0.20;
+        }
+
         dummy.position.set(x, y, z);
-        dummy.scale.set(tang, norm, tang);
-
-        // Align the ellipsoid's Y-axis (thin axis) to the surface normal
-        normal.set(nx, ny, nz);
+        dummy.scale.set(sx, sy, sz);
+        normal.set(nx, ny, nz).normalize();
         dummy.quaternion.setFromUnitVectors(yAxis, normal);
-        // Random spin around normal for tangential variety
-        dummy.rotateOnWorldAxis(normal, Math.random() * Math.PI);
-
+        dummy.rotateOnWorldAxis(normal, Math.random() * Math.PI * 2);
         dummy.updateMatrix();
         cloud.setMatrixAt(i, dummy.matrix);
 
-        // Color: hue from azimuth angle, saturation/lightness with slight randomness.
-        // Adjacent Gaussians share similar hues — mimics view-dependent SH color.
-        const hue = (Math.atan2(nz, nx) / (Math.PI * 2) + 0.5 + ny * 0.15) % 1.0;
-        color.setHSL(hue, 0.65 + Math.random() * 0.25, 0.55 + Math.random() * 0.2);
+        color.setHSL(hue, sat, lig);
         cloud.setColorAt(i, color);
     }
 
     cloud.instanceMatrix.needsUpdate = true;
     if (cloud.instanceColor) cloud.instanceColor.needsUpdate = true;
-
     return cloud;
 }
 
@@ -400,7 +436,7 @@ function setupGUI() {
     const gui = new GUI();
     
     gui.add(params, 'showKnowledge').name('💡 Knowledge Base');
-    gui.add(params, 'cameraZoom', 1.5, 12, 0.1).name('🔍 Zoom').onChange(v => {
+    gui.add(params, 'cameraZoom', 0.8, 6, 0.1).name('🔍 Zoom').onChange(v => {
         const offset = new THREE.Vector3().subVectors(camera.position, controls.target);
         offset.setLength(v);
         camera.position.copy(controls.target).add(offset);
