@@ -42,6 +42,26 @@ let worker;
 let currentStep = 0;
 let distancesBuffer = null;
 let pendingPoints = null; // point cloud from step 1, shown in step 2
+let slicePosCtrl = null;
+
+const SLICE_MIN_POS = -1.9;
+const SLICE_MAX_POS = 1.9;
+const SLICE_SCAN_LERP = 0.12;
+const POINT_REVEAL_DURATION_MS = 1100;
+const sliceScanState = {
+    active: false,
+    currentPos: params.slicePos,
+    targetPos: params.slicePos,
+    progress: 0,
+    pulsePhase: 0,
+};
+const pointRevealState = {
+    active: false,
+    startTime: 0,
+    durationMs: POINT_REVEAL_DURATION_MS,
+    totalPoints: 0,
+    currentCount: 0,
+};
 
 const DEPTH_RES = 48; // must match worker.js
 
@@ -473,12 +493,56 @@ function setupSlicePlane() {
         map: texture, 
         side: THREE.DoubleSide, 
         transparent: true, 
-        opacity: 0.9 
+        opacity: 0.82,
+        color: new THREE.Color(0xffffff),
     });
     slicePlane = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), sliceMat);
     slicePlane.rotation.y = Math.PI / 2;
     slicePlane.visible = false;
     scene.add(slicePlane);
+}
+
+function progressToSlicePos(progress) {
+    return SLICE_MIN_POS + (SLICE_MAX_POS - SLICE_MIN_POS) * progress;
+}
+
+function setSlicePosition(nextPos, { updateGui = false } = {}) {
+    params.slicePos = THREE.MathUtils.clamp(nextPos, SLICE_MIN_POS, SLICE_MAX_POS);
+    slicePlane.position.x = params.slicePos;
+    sliceScanState.currentPos = params.slicePos;
+    if (updateGui && slicePosCtrl) slicePosCtrl.updateDisplay();
+}
+
+function setSliceScanTarget(progress) {
+    sliceScanState.active = true;
+    sliceScanState.progress = progress;
+    sliceScanState.targetPos = progressToSlicePos(progress);
+}
+
+function stopSliceScan() {
+    sliceScanState.active = false;
+    sliceScanState.progress = 0;
+    sliceScanState.pulsePhase = 0;
+    sliceScanState.targetPos = params.slicePos;
+    if (slicePlane?.material) {
+        slicePlane.material.opacity = 0.82;
+        slicePlane.material.color.setRGB(1, 1, 1);
+    }
+}
+
+function easeOutCubic(t) {
+    return 1 - (1 - t) ** 3;
+}
+
+function stopPointReveal({ showAll = true } = {}) {
+    pointRevealState.active = false;
+    pointRevealState.startTime = 0;
+    if (showAll && pointRevealState.totalPoints > 0) {
+        pointCloud.geometry.setDrawRange(0, pointRevealState.totalPoints);
+        pointRevealState.currentCount = pointRevealState.totalPoints;
+    }
+    pointCloud.material.opacity = params.showPoints ? 0.8 : pointCloud.material.opacity;
+    pointCloud.material.size = 0.02;
 }
 
 function updateSliceTexture(distances) {
@@ -499,7 +563,7 @@ function updateSliceTexture(distances) {
             
             // Map d (-mu to mu) to color
             // Blue for negative (inside), Red for positive (outside), White for zero
-            const val = d / params.mu; // -1 to 1
+            const val = THREE.MathUtils.clamp(d / params.mu, -1, 1);
             const r = val > 0 ? 255 : 255 * (1 + val);
             const b = val < 0 ? 255 : 255 * (1 - val);
             const g = 255 * (1 - Math.abs(val));
@@ -547,9 +611,9 @@ function setupGUI() {
     const steps = gui.addFolder('Steps');
     const stepCtrls = [
         steps.add(params, 'step1').name('1. Render Depth Maps'),
-        steps.add(params, 'step2').name('2. Back-project Points'),
-        steps.add(params, 'step3').name('3. Voxelize'),
-        steps.add(params, 'step4').name('4. Fuse Logic'),
+        steps.add(params, 'step2').name('2. Reconstruct Point Cloud'),
+        steps.add(params, 'step3').name('3. Mark Active Voxels'),
+        steps.add(params, 'step4').name('4. Integrate TSDF'),
         steps.add(params, 'step5').name('5. Extract Mesh'),
     ];
     steps.add(params, 'reset').name('Reset Everything');
@@ -568,8 +632,9 @@ function setupGUI() {
         .onChange(v => { marchingCubes.visible = v; marchingWireframe.visible = v; });
     const ctrlSlice = view.add(params, 'showSlice').name('Show Slice')
         .onChange(v => { slicePlane.visible = v; if (v && distancesBuffer) updateSliceTexture(distancesBuffer); });
-    view.add(params, 'slicePos', -1.9, 1.9).name('Slice Position').onChange(() => {
-        slicePlane.position.x = params.slicePos;
+    slicePosCtrl = view.add(params, 'slicePos', SLICE_MIN_POS, SLICE_MAX_POS).name('Slice Position').onChange(() => {
+        stopSliceScan();
+        setSlicePosition(params.slicePos);
         if (distancesBuffer) updateSliceTexture(distancesBuffer);
     });
 
@@ -625,18 +690,22 @@ function initWorker() {
                 cameraHelpers.forEach(h => {
                     if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
                 });
-                updateStatus('Step 1 Complete: All depth maps rendered. Run Step 2 to back-project points.');
+                updateStatus('Step 1 Complete: All depth maps rendered. Run Step 2 to reconstruct the point cloud.');
                 break;
 
-            case 'voxels': renderVoxels(data); updateStatus('Step 3 Complete: Affected Voxels Identified.'); break;
+            case 'voxels': renderVoxels(data); updateStatus('Step 3 Complete: Active TSDF voxels identified.'); break;
 
             case 'fusing_progress': {
                 const percent = (data.progress * 100).toFixed(0);
-                updateStatus(`Step 4: Fusing Logic... ${percent}%`);
-                if (params.showSlice) updateSliceTexture(data.distances);
+                distancesBuffer = data.distances;
+                setSliceScanTarget(data.progress);
+                updateStatus(`Step 4: Integrating TSDF... ${percent}%`);
+                if (params.showSlice && !sliceScanState.active) updateSliceTexture(data.distances);
                 if (data.isDone) {
-                    distancesBuffer = data.distances;
-                    updateStatus(`Step 4 Complete: TSDF field built in ${data.time.toFixed(2)}ms. Run Step 5 to extract mesh.`);
+                    stopSliceScan();
+                    setSlicePosition(progressToSlicePos(1), { updateGui: true });
+                    if (params.showSlice) updateSliceTexture(data.distances);
+                    updateStatus(`Step 4 Complete: TSDF field integrated in ${data.time.toFixed(2)}ms. Run Step 5 to extract the mesh.`);
                 }
                 break;
             }
@@ -658,6 +727,9 @@ function initWorker() {
                 currentStep = 0;
                 pendingPoints = null;
                 distancesBuffer = null;
+                stopPointReveal({ showAll: false });
+                stopSliceScan();
+                setSlicePosition(0, { updateGui: true });
                 highlightStep(0); // clears all highlights
                 clearScanRays();
                 scene.remove(gaussianCloud);
@@ -725,7 +797,7 @@ function triggerStep(step) {
         setVis(ctrlSlice, false);
         setVis(ctrlMesh, false);
         renderPoints(pendingPoints);
-        updateStatus('Step 2 Complete: Points back-projected from depth maps.');
+        updateStatus('Step 2: Reconstructing point cloud...');
 
     } else if (step === 3) {
         if (currentStep < 2) return updateStatus('Error: Complete Step 2 first.');
@@ -743,6 +815,8 @@ function triggerStep(step) {
         if (currentStep < 3) return updateStatus('Error: Complete Step 3 first.');
         currentStep = 4;
         highlightStep(4);
+        setSlicePosition(SLICE_MIN_POS, { updateGui: true });
+        setSliceScanTarget(0);
         setVis(ctrlGaussians, false);
         setVis(ctrlCamera, false);
         setVis(ctrlPoints, false);
@@ -752,7 +826,7 @@ function triggerStep(step) {
         worker.postMessage({ type: 'step4_fuse' });
 
     } else if (step === 5) {
-        if (currentStep < 4) return updateStatus('Error: Complete Step 5 first.');
+        if (currentStep < 4) return updateStatus('Error: Complete Step 4 first.');
         currentStep = 5;
         highlightStep(5);
         worker.postMessage({ type: 'step5_extract' });
@@ -768,6 +842,13 @@ function renderPoints(data) {
         positions[i * 3 + 2] = data[i * 7 + 2];
     }
     pointCloud.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    pointCloud.geometry.setDrawRange(0, 0);
+    pointCloud.material.opacity = 0.18;
+    pointCloud.material.size = 0.028;
+    pointRevealState.active = true;
+    pointRevealState.startTime = performance.now();
+    pointRevealState.totalPoints = numPoints;
+    pointRevealState.currentCount = 0;
     pointCloud.visible = params.showPoints;
 }
 
@@ -826,6 +907,40 @@ function animate() {
             r.startPos.z + (r.endPos.z - r.startPos.z) * r.progress,
         );
         pos.needsUpdate = true;
+    }
+
+    if (pointCloud.visible && pointRevealState.active) {
+        const elapsed = performance.now() - pointRevealState.startTime;
+        const t = Math.min(1, elapsed / pointRevealState.durationMs);
+        const eased = easeOutCubic(t);
+        const nextCount = Math.floor(pointRevealState.totalPoints * eased);
+
+        if (nextCount !== pointRevealState.currentCount) {
+            pointCloud.geometry.setDrawRange(0, nextCount);
+            pointRevealState.currentCount = nextCount;
+        }
+
+        pointCloud.material.opacity = 0.18 + eased * 0.62;
+        pointCloud.material.size = 0.028 - eased * 0.008;
+
+        if (t >= 1) {
+            stopPointReveal();
+            updateStatus('Step 2 Complete: Point cloud reconstructed from the depth maps.');
+        }
+    }
+
+    if (slicePlane.visible && distancesBuffer && sliceScanState.active) {
+        sliceScanState.pulsePhase += 0.12;
+        const nextPos = THREE.MathUtils.lerp(sliceScanState.currentPos, sliceScanState.targetPos, SLICE_SCAN_LERP);
+        const moved = Math.abs(nextPos - sliceScanState.currentPos);
+        if (moved > 0.0005) {
+            setSlicePosition(nextPos, { updateGui: true });
+            updateSliceTexture(distancesBuffer);
+        }
+
+        const pulse = 0.5 + 0.5 * Math.sin(sliceScanState.pulsePhase);
+        slicePlane.material.opacity = 0.7 + pulse * 0.2;
+        slicePlane.material.color.setRGB(1.0, 0.92 + pulse * 0.08, 0.92 + pulse * 0.05);
     }
 
     renderer.render(scene, camera);
