@@ -37,6 +37,7 @@ let scene, camera, renderer, controls;
 let marchingCubes, marchingWireframe, pointCloud, voxelCloud, slicePlane;
 let gaussianCloud = null;
 let cameraHelpers = [];
+let scanLines = []; // animated rays during step 1
 let worker;
 let currentStep = 0;
 let distancesBuffer = null;
@@ -221,6 +222,90 @@ function createCamIcon(position) {
     group.quaternion.copy(cam.quaternion);
 
     return group;
+}
+
+// ---------------------------------------------------------------------------
+// Scan-ray helpers (Step 1 animation)
+// ---------------------------------------------------------------------------
+
+const CAM_COUNT_MAIN = 8;
+const CAM_RADIUS_MAIN = 2.5;
+const CAM_HEIGHT_MAIN = 1.0;
+
+/** Remove all scan rays from the scene and restore camera icon colours. */
+function clearScanRays() {
+    scanLines.forEach(r => scene.remove(r.line));
+    scanLines = [];
+    cameraHelpers.forEach(h => {
+        if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
+    });
+}
+
+/**
+ * Compute N target points on the unit sphere that are visible from camera camIdx.
+ * Uses analytic ray-sphere intersection so points land exactly on the surface.
+ */
+function getSurfaceTargets(camIdx, n) {
+    const angle = (camIdx / CAM_COUNT_MAIN) * Math.PI * 2;
+    const camPos = new THREE.Vector3(
+        CAM_RADIUS_MAIN * Math.cos(angle),
+        CAM_HEIGHT_MAIN,
+        CAM_RADIUS_MAIN * Math.sin(angle),
+    );
+    const fwd   = camPos.clone().negate().normalize();
+    const right = new THREE.Vector3(-fwd.z, 0, fwd.x).normalize();
+    const up    = new THREE.Vector3().crossVectors(right, fwd).normalize();
+
+    const targets = [];
+    for (let i = 0; i < n; i++) {
+        const phi    = (i / n) * Math.PI * 2;
+        const spread = i === 0 ? 0 : 0.38; // centre ray + ring
+        const dir = fwd.clone()
+            .addScaledVector(right, Math.cos(phi) * spread)
+            .addScaledVector(up,    Math.sin(phi) * spread)
+            .normalize();
+
+        // Ray-sphere intersection (unit sphere at origin)
+        const b    = camPos.dot(dir);
+        const disc = b * b - (camPos.lengthSq() - 1);
+        if (disc >= 0) {
+            const t = -b - Math.sqrt(disc);
+            if (t > 0) { targets.push(camPos.clone().addScaledVector(dir, t)); continue; }
+        }
+        targets.push(dir.clone()); // fallback: unit-distance point in ray direction
+    }
+    return targets;
+}
+
+/**
+ * Spawn animated scan rays from camera camIdx toward the target surface.
+ * Previous camera rays are kept visible (building up the scan picture).
+ */
+function createScanRays(camIdx) {
+    // Highlight active camera in yellow; leave done cameras frost-blue
+    cameraHelpers.forEach((h, i) => {
+        if (h.children[0]) {
+            h.children[0].material.color.setHex(i === camIdx ? 0xebcb8b : 0x88c0d0);
+        }
+    });
+
+    const camPos  = cameraHelpers[camIdx].position.clone();
+    const targets = getSurfaceTargets(camIdx, 7);
+
+    targets.forEach(endPos => {
+        const positions = new Float32Array([
+            camPos.x, camPos.y, camPos.z, // start (fixed)
+            camPos.x, camPos.y, camPos.z, // end   (animates toward endPos)
+        ]);
+        const geo  = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const line = new THREE.Line(
+            geo,
+            new THREE.LineBasicMaterial({ color: 0xa3be8c, transparent: true, opacity: 0.75 }),
+        );
+        scene.add(line);
+        scanLines.push({ line, startPos: camPos.clone(), endPos, progress: 0 });
+    });
 }
 
 init();
@@ -453,40 +538,44 @@ function setupGUI() {
     settings.add(params, 'gaussianCount', 100, 1000, 50).name('Gaussian Count').onChange(() => {
         scene.remove(gaussianCloud);
         gaussianCloud = createGaussianCloud(params.type);
-        gaussianCloud.visible = params.showGaussians && currentStep < 5;
+        gaussianCloud.visible = params.showGaussians;
         scene.add(gaussianCloud);
     });
     settings.add(params, 'mu', 0.05, 0.4).name('Truncation (μ)');
     settings.add(params, 'noise', 0, 0.2).name('Noise');
 
     const steps = gui.addFolder('Steps');
-    steps.add(params, 'step1').name('1. Render Depth Maps');
-    steps.add(params, 'step2').name('2. Show Point Cloud');
-    steps.add(params, 'step3').name('3. Voxelize');
-    steps.add(params, 'step4').name('4. Fuse Logic');
-    steps.add(params, 'step5').name('5. Extract Mesh');
+    const stepCtrls = [
+        steps.add(params, 'step1').name('1. Render Depth Maps'),
+        steps.add(params, 'step2').name('2. Back-project Points'),
+        steps.add(params, 'step3').name('3. Voxelize'),
+        steps.add(params, 'step4').name('4. Fuse Logic'),
+        steps.add(params, 'step5').name('5. Extract Mesh'),
+    ];
     steps.add(params, 'reset').name('Reset Everything');
+    window._stepCtrls = stepCtrls;
 
     const view = gui.addFolder('Visibility');
-    view.add(params, 'showGaussians').name('Show Gaussians').onChange(v => {
-        gaussianCloud.visible = v && currentStep < 5;
-    });
-    view.add(params, 'showPoints').name('Show Points').onChange(v => pointCloud.visible = v && currentStep >= 2);
-    view.add(params, 'showVoxels').name('Show Voxels').onChange(v => voxelCloud.visible = v && currentStep >= 3);
-    view.add(params, 'showMesh').name('Show Mesh').onChange(v => {
-        marchingCubes.visible = v && currentStep === 5;
-        marchingWireframe.visible = v && currentStep === 5;
-    });
-    view.add(params, 'showCamera').name('Show Camera').onChange(v => cameraHelpers.forEach(h => h.visible = v));
-    view.add(params, 'showSlice').name('Show Slice').onChange(v => {
-        slicePlane.visible = v && currentStep >= 4;
-        if (v && distancesBuffer) updateSliceTexture(distancesBuffer);
-    });
+    const ctrlGaussians = view.add(params, 'showGaussians').name('Show Gaussians')
+        .onChange(v => { gaussianCloud.visible = v; });
+    const ctrlCamera = view.add(params, 'showCamera').name('Show Camera')
+        .onChange(v => cameraHelpers.forEach(h => h.visible = v));
+    const ctrlPoints = view.add(params, 'showPoints').name('Show Points')
+        .onChange(v => { pointCloud.visible = v; });
+    const ctrlVoxels = view.add(params, 'showVoxels').name('Show Voxels')
+        .onChange(v => { voxelCloud.visible = v; });
+    const ctrlMesh = view.add(params, 'showMesh').name('Show Mesh')
+        .onChange(v => { marchingCubes.visible = v; marchingWireframe.visible = v; });
+    const ctrlSlice = view.add(params, 'showSlice').name('Show Slice')
+        .onChange(v => { slicePlane.visible = v; if (v && distancesBuffer) updateSliceTexture(distancesBuffer); });
     view.add(params, 'slicePos', -1.9, 1.9).name('Slice Position').onChange(() => {
         slicePlane.position.x = params.slicePos;
         if (distancesBuffer) updateSliceTexture(distancesBuffer);
     });
-    
+
+    // Expose controllers so triggerStep / worker handlers can update params + GUI in sync
+    window._visCtrl = { ctrlGaussians, ctrlCamera, ctrlPoints, ctrlVoxels, ctrlMesh, ctrlSlice };
+
     steps.open();
 }
 
@@ -525,14 +614,18 @@ function initWorker() {
                 }
                 ctx.putImageData(imgData, 0, 0);
                 icon.depthTexture.needsUpdate = true;
+                createScanRays(camIndex);
                 updateStatus(`Step 1: Rendering depth maps... camera ${camIndex + 1} / ${cameraHelpers.length}`);
                 break;
             }
 
-            // Step 1 complete: store points, do NOT show yet (step 2 reveals them)
+            // Step 1 complete: store points, restore camera colours, keep rays visible
             case 'points':
                 pendingPoints = data;
-                updateStatus('Step 1 Complete: All depth maps rendered. Run Step 2 to reveal point cloud.');
+                cameraHelpers.forEach(h => {
+                    if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
+                });
+                updateStatus('Step 1 Complete: All depth maps rendered. Run Step 2 to back-project points.');
                 break;
 
             case 'voxels': renderVoxels(data); updateStatus('Step 3 Complete: Affected Voxels Identified.'); break;
@@ -540,13 +633,7 @@ function initWorker() {
             case 'fusing_progress': {
                 const percent = (data.progress * 100).toFixed(0);
                 updateStatus(`Step 4: Fusing Logic... ${percent}%`);
-
-                // Step 4 focuses on the TSDF distance field — force slice plane, hide mesh
-                marchingCubes.visible = false;
-                marchingWireframe.visible = false;
-                slicePlane.visible = true;
-                updateSliceTexture(data.distances);
-
+                if (params.showSlice) updateSliceTexture(data.distances);
                 if (data.isDone) {
                     distancesBuffer = data.distances;
                     updateStatus(`Step 4 Complete: TSDF field built in ${data.time.toFixed(2)}ms. Run Step 5 to extract mesh.`);
@@ -554,69 +641,120 @@ function initWorker() {
                 break;
             }
 
-            case 'extracted':
+            case 'extracted': {
                 distancesBuffer = data;
-                // Step 5: Gaussians → Mesh — the key visual transformation
-                gaussianCloud.visible = false; // always hide regardless of showGaussians toggle
-                slicePlane.visible = false;
                 renderMesh(data);
-                marchingCubes.visible = params.showMesh;
-                marchingWireframe.visible = params.showMesh;
+                const c = window._visCtrl;
+                setVis(c.ctrlGaussians, false);
+                setVis(c.ctrlPoints, false);
+                setVis(c.ctrlVoxels, false);
+                setVis(c.ctrlSlice, false);
+                setVis(c.ctrlMesh, true);
                 updateStatus('Step 5 Complete: Mesh Extracted via Marching Cubes.');
                 break;
+            }
 
-            case 'reset_done':
+            case 'reset_done': {
                 currentStep = 0;
                 pendingPoints = null;
+                distancesBuffer = null;
+                highlightStep(0); // clears all highlights
+                clearScanRays();
                 scene.remove(gaussianCloud);
                 gaussianCloud = createGaussianCloud(params.type);
-                gaussianCloud.visible = params.showGaussians;
                 scene.add(gaussianCloud);
-                pointCloud.visible = false;
-                voxelCloud.visible = false;
-                marchingCubes.visible = false;
-                marchingWireframe.visible = false;
-                slicePlane.visible = false;
+                const rc = window._visCtrl;
+                setVis(rc.ctrlGaussians, true);
+                setVis(rc.ctrlCamera, true);
+                setVis(rc.ctrlPoints, false);
+                setVis(rc.ctrlVoxels, false);
+                setVis(rc.ctrlSlice, false);
+                setVis(rc.ctrlMesh, false);
                 cameraHelpers.forEach(h => {
-                    h.visible = params.showCamera;
-                    // Clear depth map texture
                     if (h.depthCtx) {
                         h.depthCtx.fillStyle = '#0d1117';
                         h.depthCtx.fillRect(0, 0, DEPTH_RES, DEPTH_RES);
                         h.depthTexture.needsUpdate = true;
                     }
                 });
-                distancesBuffer = null;
                 updateStatus('Reset Complete. Ready for Step 1.');
                 break;
+            }
         }
     };
 }
 
+
+/** Update a visibility toggle param + its GUI controller, which fires onChange. */
+function setVis(ctrl, value) {
+    ctrl.setValue(value);
+}
+
+function highlightStep(step) {
+    window._stepCtrls.forEach((c, i) => {
+        c.domElement.classList.toggle('active-step', i === step - 1);
+    });
+}
+
 function triggerStep(step) {
+    const { ctrlGaussians, ctrlCamera, ctrlPoints, ctrlVoxels, ctrlMesh, ctrlSlice } = window._visCtrl;
+
     if (step === 1) {
         currentStep = 1;
+        highlightStep(1);
+        clearScanRays();
+        setVis(ctrlGaussians, true);
+        setVis(ctrlCamera, true);
+        setVis(ctrlPoints, false);
+        setVis(ctrlVoxels, false);
+        setVis(ctrlSlice, false);
+        setVis(ctrlMesh, false);
         sendInitToWorker();
         worker.postMessage({ type: 'step1_render' });
+
     } else if (step === 2) {
         if (currentStep < 1) return updateStatus('Error: Complete Step 1 first.');
         if (!pendingPoints) return updateStatus('Error: Step 1 not finished yet.');
         currentStep = 2;
+        highlightStep(2);
+        clearScanRays();
+        setVis(ctrlGaussians, false);
+        setVis(ctrlCamera, false);
+        setVis(ctrlPoints, true);
+        setVis(ctrlVoxels, false);
+        setVis(ctrlSlice, false);
+        setVis(ctrlMesh, false);
         renderPoints(pendingPoints);
-        updateStatus('Step 2 Complete: Point cloud from depth map back-projection.');
+        updateStatus('Step 2 Complete: Points back-projected from depth maps.');
+
     } else if (step === 3) {
         if (currentStep < 2) return updateStatus('Error: Complete Step 2 first.');
         currentStep = 3;
+        highlightStep(3);
+        setVis(ctrlGaussians, false);
+        setVis(ctrlCamera, false);
+        setVis(ctrlPoints, true);
+        setVis(ctrlVoxels, true);
+        setVis(ctrlSlice, false);
+        setVis(ctrlMesh, false);
         worker.postMessage({ type: 'step3_voxelize' });
+
     } else if (step === 4) {
         if (currentStep < 3) return updateStatus('Error: Complete Step 3 first.');
         currentStep = 4;
-        marchingCubes.visible = false;
-        marchingWireframe.visible = false;
+        highlightStep(4);
+        setVis(ctrlGaussians, false);
+        setVis(ctrlCamera, false);
+        setVis(ctrlPoints, false);
+        setVis(ctrlVoxels, true);
+        setVis(ctrlSlice, true);
+        setVis(ctrlMesh, false);
         worker.postMessage({ type: 'step4_fuse' });
+
     } else if (step === 5) {
-        if (currentStep < 4) return updateStatus('Error: Complete Step 4 first.');
+        if (currentStep < 4) return updateStatus('Error: Complete Step 5 first.');
         currentStep = 5;
+        highlightStep(5);
         worker.postMessage({ type: 'step5_extract' });
     }
 }
@@ -676,5 +814,19 @@ function onWindowResize() {
 function animate() {
     requestAnimationFrame(animate);
     controls.update();
+
+    // Grow scan rays toward their target (step 1 animation)
+    for (const r of scanLines) {
+        if (r.progress >= 1) continue;
+        r.progress = Math.min(1, r.progress + 0.06);
+        const pos = r.line.geometry.attributes.position;
+        pos.setXYZ(1,
+            r.startPos.x + (r.endPos.x - r.startPos.x) * r.progress,
+            r.startPos.y + (r.endPos.y - r.startPos.y) * r.progress,
+            r.startPos.z + (r.endPos.z - r.startPos.z) * r.progress,
+        );
+        pos.needsUpdate = true;
+    }
+
     renderer.render(scene, camera);
 }

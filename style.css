@@ -191,6 +191,13 @@ header p {
     background: var(--nord10);
 }
 
+/* Active step button highlight */
+.lil-gui .controller.active-step > .widget > button {
+    background: var(--nord10) !important;
+    color: var(--nord6) !important;
+    font-weight: 600;
+}
+
 /* Scrollbar styling */
 .scroll-content::-webkit-scrollbar {
     width: 6px;
