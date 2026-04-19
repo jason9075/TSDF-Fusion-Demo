@@ -38,22 +38,20 @@ export class TSDFVolume {
 
     /**
      * Fuse a point cloud into the volume
-     * @param {Float32Array} points - [x, y, z, weight, ...]
+     * @param {Float32Array} points - [x, y, z, nx, ny, nz, weight, ...]
      */
     fuse(points) {
-        const numPoints = points.length / 4;
+        const numPoints = points.length / 7;
         
         for (let i = 0; i < numPoints; i++) {
-            const px = points[i * 4];
-            const py = points[i * 4 + 1];
-            const pz = points[i * 4 + 2];
-            const pw = points[i * 4 + 3];
+            const px = points[i * 7];
+            const py = points[i * 7 + 1];
+            const pz = points[i * 7 + 2];
+            const nx = points[i * 7 + 3];
+            const ny = points[i * 7 + 4];
+            const nz = points[i * 7 + 5];
+            const pw = points[i * 7 + 6];
 
-            // Update voxels in a local neighborhood around the point
-            // For a simple TSDF, we update voxels that the "camera" would see.
-            // But since this is from unstructured points (like 3DGS), 
-            // we can treat each point as a surface "hit" and update nearby voxels.
-            
             const range = Math.ceil(this.mu / this.voxelSize);
             const nix = Math.floor((px + this.extent) / this.voxelSize);
             const niy = Math.floor((py + this.extent) / this.voxelSize);
@@ -70,30 +68,12 @@ export class TSDFVolume {
 
                         const idx = ix + iy * this.size + iz * this.size * this.size;
                         
-                        // Voxel center world pos
                         const vx = (ix + 0.5) * this.voxelSize - this.extent;
                         const vy = (iy + 0.5) * this.voxelSize - this.extent;
                         const vz = (iz + 0.5) * this.voxelSize - this.extent;
 
-                        // Distance from voxel to point
-                        // In real TSDF fusion (KinectFusion style), this is projection-based.
-                        // Here we approximate with Euclidean distance to the point
-                        // but we need a surface normal to know if it's "behind" or "in front".
-                        // For this demo, let's treat the point as the surface zero crossing.
-                        
-                        const dist = Math.sqrt((vx - px)**2 + (vy - py)**2 + (vz - pz)**2);
-                        
-                        // We need a direction. Let's assume the surface normal points towards the sensor (origin).
-                        // Or simpler: use the signed distance if we know the sensor position.
-                        // For a synthetic sphere centered at (0,0,0), normal is (px, py, pz) normalized.
-                        
-                        const nx = px;
-                        const ny = py;
-                        const nz = pz;
-                        const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
-                        
-                        // Signed distance along normal
-                        const sdf = ((vx - px) * (nx / nLen) + (vy - py) * (ny / nLen) + (vz - pz) * (nz / nLen));
+                        // Signed distance along normal: (V - P) · N
+                        const sdf = (vx - px) * nx + (vy - py) * ny + (vz - pz) * nz;
                         
                         if (Math.abs(sdf) <= this.mu) {
                             const currentD = this.distances[idx];
