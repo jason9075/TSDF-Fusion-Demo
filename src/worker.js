@@ -59,31 +59,30 @@ self.onmessage = (e) => {
 async function fuseProgressive(vol, points) {
     const numPoints = points.length / 7;
     const chunkSize = 500;
+    // Send a visual update every N chunks to halve postMessage overhead
+    const reportEvery = 2;
     const startTime = performance.now();
+    let chunkIndex = 0;
 
     for (let i = 0; i < numPoints; i += chunkSize) {
         const end = Math.min(i + chunkSize, numPoints);
-        const chunk = points.subarray(i * 7, end * 7);
-        
-        vol.fuse(chunk);
+        vol.fuse(points.subarray(i * 7, end * 7));
+        chunkIndex++;
 
-        // Send intermediate result for visualization
-        const distances = vol.getGridData();
-        const progress = end / numPoints;
-        
-        self.postMessage({ 
-            type: 'fusing_progress', 
-            data: {
-                distances: distances,
-                progress: progress,
-                isDone: end === numPoints,
-                time: performance.now() - startTime
-            }
-        });
+        const isDone = end === numPoints;
+        if (isDone || chunkIndex % reportEvery === 0) {
+            self.postMessage({
+                type: 'fusing_progress',
+                data: {
+                    distances: vol.getGridData(),
+                    progress: end / numPoints,
+                    isDone,
+                    time: performance.now() - startTime,
+                },
+            });
+        }
 
-        // Small yield to let worker handle other things if needed 
-        // and simulate gradual growth for humans to see
-        await new Promise(r => setTimeout(r, 80)); 
+        await new Promise(r => setTimeout(r, 80));
     }
 }
 

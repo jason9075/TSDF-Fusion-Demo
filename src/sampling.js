@@ -31,6 +31,8 @@ export class SurfaceSampler {
                 nx = Math.random() - 0.5;
                 ny = Math.random() - 0.5;
                 nz = Math.random() - 0.5;
+                const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                nx /= nLen; ny /= nLen; nz /= nLen;
             } else {
                 if (this.type === 'sphere') {
                     const phi = Math.random() * Math.PI * 2;

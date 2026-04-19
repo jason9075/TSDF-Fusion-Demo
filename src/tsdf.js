@@ -19,6 +19,8 @@ export class TSDFVolume {
         this.weights = new Float32Array(this.numVoxels).fill(0.0);
         
         this.voxelSize = (this.extent * 2) / this.size;
+        this.sizeSq = this.size * this.size;
+        this.range = Math.ceil(this.mu / this.voxelSize);
     }
 
     /**
@@ -28,12 +30,12 @@ export class TSDFVolume {
         const ix = Math.floor((x + this.extent) / this.voxelSize);
         const iy = Math.floor((y + this.extent) / this.voxelSize);
         const iz = Math.floor((z + this.extent) / this.voxelSize);
-        
+
         if (ix < 0 || ix >= this.size || iy < 0 || iy >= this.size || iz < 0 || iz >= this.size) {
             return -1;
         }
-        
-        return ix + iy * this.size + iz * this.size * this.size;
+
+        return ix + iy * this.size + iz * this.sizeSq;
     }
 
     /**
@@ -52,21 +54,20 @@ export class TSDFVolume {
             const nz = points[i * 7 + 5];
             const pw = points[i * 7 + 6];
 
-            const range = Math.ceil(this.mu / this.voxelSize);
             const nix = Math.floor((px + this.extent) / this.voxelSize);
             const niy = Math.floor((py + this.extent) / this.voxelSize);
             const niz = Math.floor((pz + this.extent) / this.voxelSize);
 
-            for (let dx = -range; dx <= range; dx++) {
-                for (let dy = -range; dy <= range; dy++) {
-                    for (let dz = -range; dz <= range; dz++) {
+            for (let dx = -this.range; dx <= this.range; dx++) {
+                for (let dy = -this.range; dy <= this.range; dy++) {
+                    for (let dz = -this.range; dz <= this.range; dz++) {
                         const ix = nix + dx;
                         const iy = niy + dy;
                         const iz = niz + dz;
 
                         if (ix < 0 || ix >= this.size || iy < 0 || iy >= this.size || iz < 0 || iz >= this.size) continue;
 
-                        const idx = ix + iy * this.size + iz * this.size * this.size;
+                        const idx = ix + iy * this.size + iz * this.sizeSq;
                         
                         const vx = (ix + 0.5) * this.voxelSize - this.extent;
                         const vy = (iy + 0.5) * this.voxelSize - this.extent;

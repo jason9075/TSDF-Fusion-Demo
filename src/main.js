@@ -129,37 +129,22 @@ function init() {
 
 let currentLang = 'en';
 
+function applyLanguage(lang) {
+    document.querySelectorAll('.lang-en').forEach(el => el.classList.toggle('hidden', lang !== 'en'));
+    document.querySelectorAll('.lang-zh').forEach(el => el.classList.toggle('hidden', lang !== 'zh'));
+    renderMath();
+}
+
 function toggleLanguage() {
     currentLang = currentLang === 'en' ? 'zh' : 'en';
-    const enElements = document.querySelectorAll('.lang-en');
-    const zhElements = document.querySelectorAll('.lang-zh');
-    
-    // Use a helper to toggle visibility
-    const setVisibility = (elements, show) => {
-        elements.forEach(el => {
-            if (show) el.classList.remove('hidden');
-            else el.classList.add('hidden');
-        });
-    };
-
-    setVisibility(enElements, currentLang === 'en');
-    setVisibility(zhElements, currentLang === 'zh');
-    
-    // Re-render math to ensure any newly visible math is processed
-    renderMath();
+    applyLanguage(currentLang);
 }
 
 function toggleModal(show) {
     const modal = document.getElementById('modal-overlay');
     if (show) {
         modal.classList.remove('hidden');
-        // Ensure only one language is visible on start
-        const enElements = document.querySelectorAll('.lang-en');
-        const zhElements = document.querySelectorAll('.lang-zh');
-        enElements.forEach(el => el.classList.toggle('hidden', currentLang !== 'en'));
-        zhElements.forEach(el => el.classList.toggle('hidden', currentLang !== 'zh'));
-        
-        renderMath();
+        applyLanguage(currentLang);
     } else {
         modal.classList.add('hidden');
     }
@@ -184,40 +169,6 @@ function renderMath() {
 }
 
 function setupSlicePlane() {
-    const geometry = new THREE.PlaneGeometry(4, 4, params.resolution, params.resolution);
-    const material = new THREE.ShaderMaterial({
-        side: THREE.DoubleSide,
-        transparent: true,
-        uniforms: {
-            u_res: { value: params.resolution },
-            u_slice: { value: 0.5 },
-            u_mu: { value: params.mu },
-            u_distances: { value: new Float32Array(params.resolution**3) }
-        },
-        vertexShader: `
-            varying vec2 vUv;
-            void main() {
-                vUv = uv;
-                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-            }
-        `,
-        fragmentShader: `
-            uniform float u_res;
-            uniform float u_slice;
-            uniform float u_mu;
-            uniform float u_distances[4096]; // Limited by shader uniform limits
-            varying vec2 vUv;
-
-            void main() {
-                // This is a simplified demo slicing. In a real production app, 
-                // we would use a 3D Texture for efficiency.
-                gl_FragColor = vec4(vUv, 0.5, 0.4);
-            }
-        `
-    });
-
-    // Actually, passing a huge array to uniforms is bad. 
-    // Let's use a simpler approach for the slice: a Canvas texture.
     const canvas = document.createElement('canvas');
     canvas.width = params.resolution;
     canvas.height = params.resolution;
@@ -391,9 +342,7 @@ function renderVoxels(data) {
 }
 
 function renderMesh(distances) {
-    for (let i = 0; i < distances.length; i++) {
-        marchingCubes.field[i] = distances[i];
-    }
+    marchingCubes.field.set(distances);
     marchingCubes.isolation = 0.0;
     marchingCubes.update();
     marchingCubes.visible = params.showMesh;
