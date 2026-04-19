@@ -14,6 +14,9 @@
             }
         }
     </script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body);"></script>
 </head>
 <body>
     <div id="app">
@@ -28,6 +31,87 @@
             </div>
         </main>
     </div>
+
+    <!-- Knowledge Modal -->
+    <div id="modal-overlay" class="hidden">
+        <div id="modal-content">
+            <button id="lang-toggle">Eng/中</button>
+            <button id="close-modal">&times;</button>
+            <div id="modal-body">
+                <h2 class="lang-en">TSDF Fusion Knowledge Base</h2>
+                <h2 class="lang-zh hidden">TSDF 融合知識庫</h2>
+                
+                <div class="scroll-content">
+                    <section>
+                        <h3 class="lang-en">1. Introduction</h3>
+                        <h3 class="lang-zh hidden">1. 簡介</h3>
+                        <p class="lang-en">The Truncated Signed Distance Function (TSDF) is a volumetric representation where each voxel stores the signed distance to the nearest surface. It is the foundation for modern 3D reconstruction techniques like KinectFusion and 3D Gaussian Splatting mesh extraction.</p>
+                        <p class="lang-zh hidden">截斷式符號距離函數（TSDF）是以體素（Voxel）為基礎的 3D 表示法，每個體素存儲著到最近表面的符號距離。它是現代 3D 重建技術（如 KinectFusion 和 3D 高斯潑濺法 3DGS 網格提取）的核心基礎。</p>
+                    </section>
+                    
+                    <section>
+                        <h3 class="lang-en">2. Mathematical Formulation</h3>
+                        <h3 class="lang-zh hidden">2. 數學公式</h3>
+                        <p class="lang-en">The core of TSDF fusion is the <strong>weighted averaging</strong> of new depth observations into a global volume. For a voxel $\mathbf{p}$:</p>
+                        <p class="lang-zh hidden">TSDF 融合的核心是將新的深度觀測值<strong>加權平均</strong>整合進全局體積中。對於體素 $\mathbf{p}$：</p>
+                        
+                        <div class="formula" id="formula-d">$$D_{i}(\mathbf{p}) = \frac{W_{i-1}(\mathbf{p})D_{i-1}(\mathbf{p}) + w_i(\mathbf{p})d_i(\mathbf{p})}{W_{i-1}(\mathbf{p}) + w_i(\mathbf{p})}$$</div>
+                        <div class="formula" id="formula-w">$$W_{i}(\mathbf{p}) = W_{i-1}(\mathbf{p}) + w_i(\mathbf{p})$$</div>
+                        
+                        <div class="lang-en">
+                            <p>Where:</p>
+                            <ul>
+                                <li>$D_i(\mathbf{p})$: Cumulative signed distance.</li>
+                                <li>$W_i(\mathbf{p})$: Cumulative confidence weight.</li>
+                                <li>$d_i(\mathbf{p})$: New distance measurement.</li>
+                                <li>$w_i(\mathbf{p})$: New measurement weight.</li>
+                            </ul>
+                            <p>The value is <strong>truncated</strong> within $[-\mu, \mu]$ to focus computation near the surface.</p>
+                        </div>
+                        <div class="lang-zh hidden">
+                            <p>其中：</p>
+                            <ul>
+                                <li>$D_i(\mathbf{p})$：累積符號距離。</li>
+                                <li>$W_i(\mathbf{p})$：累積信心權重。</li>
+                                <li>$d_i(\mathbf{p})$：新的距離量測值。</li>
+                                <li>$w_i(\mathbf{p})$：新量測值的權重。</li>
+                            </ul>
+                            <p>數值會被<strong>截斷（Truncated）</strong>在 $[-\mu, \mu]$ 範圍內，以便將運算集中在表面附近。</p>
+                        </div>
+                    </section>
+                    
+                    <section>
+                        <h3 class="lang-en">3. Seminal Papers</h3>
+                        <h3 class="lang-zh hidden">3. 經典論文</h3>
+                        <ul>
+                            <li class="lang-en"><strong>Curless & Levoy (1996)</strong>: <em>"A Volumetric Method for Building Complex Models from Range Images"</em>. The original paper that defined weighted volumetric fusion.</li>
+                            <li class="lang-en"><strong>Newcombe et al. (2011)</strong>: <em>"KinectFusion: Real-Time Dense Surface Mapping and Tracking"</em>. Adapted TSDF for real-time GPU-accelerated SLAM.</li>
+                            <li class="lang-zh hidden"><strong>Curless & Levoy (1996)</strong>: <em>"A Volumetric Method for Building Complex Models from Range Images"</em>。定義了加權體積融合的原創論文。</li>
+                            <li class="lang-zh hidden"><strong>Newcombe et al. (2011)</strong>: <em>"KinectFusion: Real-Time Dense Surface Mapping and Tracking"</em>。將 TSDF 應用於 GPU 加速的即時 SLAM。</li>
+                        </ul>
+                    </section>
+
+                    <section>
+                        <h3 class="lang-en">4. Reconstruction Pipeline</h3>
+                        <h3 class="lang-zh hidden">4. 重建流程</h3>
+                        <ol class="lang-en">
+                            <li><strong>Point Generation</strong>: Sampling surface points from implicit kernels.</li>
+                            <li><strong>Voxelization</strong>: Projecting points into the 3D grid and identifying affected voxels.</li>
+                            <li><strong>Fusion</strong>: Integrating distances into the volume using the formulas above.</li>
+                            <li><strong>Marching Cubes</strong>: Extracting an explicit triangle mesh from the zero-crossing of the TSDF field.</li>
+                        </ol>
+                        <ol class="lang-zh hidden">
+                            <li><strong>點雲生成 (Point Generation)</strong>：從隱式內核中採樣表面點。</li>
+                            <li><strong>體素化 (Voxelization)</strong>：將點投影到 3D 網格並識別受影響的體素。</li>
+                            <li><strong>融合 (Fusion)</strong>：使用上述公式將距離資訊整合進體積中。</li>
+                            <li><strong>移動立方體 (Marching Cubes)</strong>：從 TSDF 場的零交叉點提取出顯式的三角形網格。</li>
+                        </ol>
+                    </section>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script type="module" src="src/main.js"></script>
 </body>
 </html>

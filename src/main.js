@@ -17,6 +17,7 @@ const params = {
     showVoxels: true,
     showMesh: true,
     showSlice: false,
+    showKnowledge: () => toggleModal(true),
     slicePos: 0.0,
     type: 'sphere',
     
@@ -105,8 +106,71 @@ function init() {
     setupGUI();
     initWorker();
 
+    // Modal Event Listeners
+    document.getElementById('close-modal').addEventListener('click', () => toggleModal(false));
+    document.getElementById('lang-toggle').addEventListener('click', () => toggleLanguage());
+    document.getElementById('modal-overlay').addEventListener('click', (e) => {
+        if (e.target.id === 'modal-overlay') toggleModal(false);
+    });
+
     window.addEventListener('resize', onWindowResize);
     animate();
+}
+
+let currentLang = 'en';
+
+function toggleLanguage() {
+    currentLang = currentLang === 'en' ? 'zh' : 'en';
+    const enElements = document.querySelectorAll('.lang-en');
+    const zhElements = document.querySelectorAll('.lang-zh');
+    
+    // Use a helper to toggle visibility
+    const setVisibility = (elements, show) => {
+        elements.forEach(el => {
+            if (show) el.classList.remove('hidden');
+            else el.classList.add('hidden');
+        });
+    };
+
+    setVisibility(enElements, currentLang === 'en');
+    setVisibility(zhElements, currentLang === 'zh');
+    
+    // Re-render math to ensure any newly visible math is processed
+    renderMath();
+}
+
+function toggleModal(show) {
+    const modal = document.getElementById('modal-overlay');
+    if (show) {
+        modal.classList.remove('hidden');
+        // Ensure only one language is visible on start
+        const enElements = document.querySelectorAll('.lang-en');
+        const zhElements = document.querySelectorAll('.lang-zh');
+        enElements.forEach(el => el.classList.toggle('hidden', currentLang !== 'en'));
+        zhElements.forEach(el => el.classList.toggle('hidden', currentLang !== 'zh'));
+        
+        renderMath();
+    } else {
+        modal.classList.add('hidden');
+    }
+}
+
+function renderMath() {
+    const modalBody = document.getElementById('modal-body');
+    if (typeof renderMathInElement === 'function') {
+        renderMathInElement(modalBody, {
+            delimiters: [
+                {left: '$$', right: '$$', display: true},
+                {left: '$', right: '$', display: false},
+                {left: '\\(', right: '\\)', display: false},
+                {left: '\\[', right: '\\]', display: true}
+            ],
+            throwOnError: false
+        });
+    }
+
+    // Still render the specific formulas if needed, or let auto-render handle them
+    // Our HTML has IDs formula-d and formula-w with math content inside or we can just put math in them
 }
 
 function setupSlicePlane() {
@@ -201,6 +265,8 @@ function updateSliceTexture(distances) {
 function setupGUI() {
     const gui = new GUI();
     
+    gui.add(params, 'showKnowledge').name('💡 Knowledge Base');
+
     const settings = gui.addFolder('Settings');
     settings.add(params, 'type', ['sphere', 'torus']).name('Surface Type').onChange(resetDemo);
     settings.add(params, 'mu', 0.05, 0.4).name('Truncation (μ)');
