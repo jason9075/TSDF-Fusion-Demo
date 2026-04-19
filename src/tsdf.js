@@ -1,0 +1,115 @@
+/**
+ * TSDF (Truncated Signed Distance Function) implementation
+ */
+
+export class TSDFVolume {
+    /**
+     * @param {Object} options
+     * @param {number} options.size - Grid resolution (N x N x N)
+     * @param {number} options.extent - World coordinate range (e.g. 2.0 means [-2, 2])
+     * @param {number} options.mu - Truncation distance
+     */
+    constructor(options = {}) {
+        this.size = options.size || 64;
+        this.extent = options.extent || 2.0;
+        this.mu = options.mu || 0.1;
+        
+        this.numVoxels = this.size * this.size * this.size;
+        this.distances = new Float32Array(this.numVoxels).fill(1.0); // 1.0 is "far" (max distance)
+        this.weights = new Float32Array(this.numVoxels).fill(0.0);
+        
+        this.voxelSize = (this.extent * 2) / this.size;
+    }
+
+    /**
+     * Map world coordinates [x, y, z] to voxel index
+     */
+    getIndex(x, y, z) {
+        const ix = Math.floor((x + this.extent) / this.voxelSize);
+        const iy = Math.floor((y + this.extent) / this.voxelSize);
+        const iz = Math.floor((z + this.extent) / this.voxelSize);
+        
+        if (ix < 0 || ix >= this.size || iy < 0 || iy >= this.size || iz < 0 || iz >= this.size) {
+            return -1;
+        }
+        
+        return ix + iy * this.size + iz * this.size * this.size;
+    }
+
+    /**
+     * Fuse a point cloud into the volume
+     * @param {Float32Array} points - [x, y, z, weight, ...]
+     */
+    fuse(points) {
+        const numPoints = points.length / 4;
+        
+        for (let i = 0; i < numPoints; i++) {
+            const px = points[i * 4];
+            const py = points[i * 4 + 1];
+            const pz = points[i * 4 + 2];
+            const pw = points[i * 4 + 3];
+
+            // Update voxels in a local neighborhood around the point
+            // For a simple TSDF, we update voxels that the "camera" would see.
+            // But since this is from unstructured points (like 3DGS), 
+            // we can treat each point as a surface "hit" and update nearby voxels.
+            
+            const range = Math.ceil(this.mu / this.voxelSize);
+            const nix = Math.floor((px + this.extent) / this.voxelSize);
+            const niy = Math.floor((py + this.extent) / this.voxelSize);
+            const niz = Math.floor((pz + this.extent) / this.voxelSize);
+
+            for (let dx = -range; dx <= range; dx++) {
+                for (let dy = -range; dy <= range; dy++) {
+                    for (let dz = -range; dz <= range; dz++) {
+                        const ix = nix + dx;
+                        const iy = niy + dy;
+                        const iz = niz + dz;
+
+                        if (ix < 0 || ix >= this.size || iy < 0 || iy >= this.size || iz < 0 || iz >= this.size) continue;
+
+                        const idx = ix + iy * this.size + iz * this.size * this.size;
+                        
+                        // Voxel center world pos
+                        const vx = (ix + 0.5) * this.voxelSize - this.extent;
+                        const vy = (iy + 0.5) * this.voxelSize - this.extent;
+                        const vz = (iz + 0.5) * this.voxelSize - this.extent;
+
+                        // Distance from voxel to point
+                        // In real TSDF fusion (KinectFusion style), this is projection-based.
+                        // Here we approximate with Euclidean distance to the point
+                        // but we need a surface normal to know if it's "behind" or "in front".
+                        // For this demo, let's treat the point as the surface zero crossing.
+                        
+                        const dist = Math.sqrt((vx - px)**2 + (vy - py)**2 + (vz - pz)**2);
+                        
+                        // We need a direction. Let's assume the surface normal points towards the sensor (origin).
+                        // Or simpler: use the signed distance if we know the sensor position.
+                        // For a synthetic sphere centered at (0,0,0), normal is (px, py, pz) normalized.
+                        
+                        const nx = px;
+                        const ny = py;
+                        const nz = pz;
+                        const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+                        
+                        // Signed distance along normal
+                        const sdf = ((vx - px) * (nx / nLen) + (vy - py) * (ny / nLen) + (vz - pz) * (nz / nLen));
+                        
+                        if (Math.abs(sdf) <= this.mu) {
+                            const currentD = this.distances[idx];
+                            const currentW = this.weights[idx];
+                            
+                            const newW = currentW + pw;
+                            this.distances[idx] = (currentW * currentD + pw * sdf) / newW;
+                            this.weights[idx] = newW;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    getGridData() {
+        return this.distances;
+    }
+}
