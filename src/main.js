@@ -12,30 +12,117 @@ const params = {
     mu: 0.15,
     noise: 0.05,
     outliers: 0.02,
-    numPoints: 5000,
+    gaussianCount: 500,
+    showGaussians: true,
     showPoints: true,
     showVoxels: true,
     showMesh: true,
     showSlice: false,
     showCamera: true,
     showKnowledge: () => toggleModal(true),
+    cameraZoom: 5.2, // initial distance = length of (3,3,3)
     slicePos: 0.0,
     type: 'sphere',
-    
+
     // Step Buttons
     step1: () => triggerStep(1),
     step2: () => triggerStep(2),
     step3: () => triggerStep(3),
     step4: () => triggerStep(4),
-    reset: () => resetDemo()
+    step5: () => triggerStep(5),
+    reset: () => resetDemo(),
 };
 
 let scene, camera, renderer, controls;
 let marchingCubes, marchingWireframe, pointCloud, voxelCloud, slicePlane;
+let gaussianCloud = null;
 let cameraHelpers = [];
 let worker;
 let currentStep = 0;
 let distancesBuffer = null;
+let pendingPoints = null; // point cloud from step 1, shown in step 2
+
+const DEPTH_RES = 48; // must match worker.js
+
+/**
+ * Build a cloud of semi-transparent colored ellipsoids that visually represents
+ * a 3D Gaussian Splatting scene. Each instance is a flattened ellipsoid (thin
+ * in the surface-normal direction, wide tangentially) — the hallmark look of GSplat.
+ * @param {'sphere'|'torus'} type
+ */
+function createGaussianCloud(type, N = params.gaussianCount) {
+    // Low-poly sphere as the base ellipsoid shape
+    const geo = new THREE.SphereGeometry(1, 5, 4);
+    const mat = new THREE.MeshBasicMaterial({
+        transparent: true,
+        opacity: 0.40,
+        depthWrite: false,
+        // Additive blending makes dense overlapping regions brighter,
+        // matching the appearance of Gaussian splats in a real renderer.
+        blending: THREE.AdditiveBlending,
+    });
+
+    const cloud = new THREE.InstancedMesh(geo, mat, N);
+
+    const dummy = new THREE.Object3D();
+    const color = new THREE.Color();
+    const yAxis = new THREE.Vector3(0, 1, 0);
+    const normal = new THREE.Vector3();
+
+    for (let i = 0; i < N; i++) {
+        let x, y, z, nx, ny, nz;
+
+        if (type === 'sphere') {
+            const phi   = Math.random() * Math.PI * 2;
+            const theta = Math.acos(2 * Math.random() - 1);
+            nx = Math.sin(theta) * Math.cos(phi);
+            ny = Math.sin(theta) * Math.sin(phi);
+            nz = Math.cos(theta);
+            x = nx; y = ny; z = nz;
+        } else {
+            const phi   = Math.random() * Math.PI * 2;
+            const theta = Math.random() * Math.PI * 2;
+            const R = 1.0, r = 0.4;
+            x  = (R + r * Math.cos(theta)) * Math.cos(phi);
+            y  = (R + r * Math.cos(theta)) * Math.sin(phi);
+            z  = r * Math.sin(theta);
+            nx = Math.cos(theta) * Math.cos(phi);
+            ny = Math.cos(theta) * Math.sin(phi);
+            nz = Math.sin(theta);
+        }
+
+        // Small position jitter to simulate imperfect 3DGS reconstruction
+        x += (Math.random() - 0.5) * 0.06;
+        y += (Math.random() - 0.5) * 0.06;
+        z += (Math.random() - 0.5) * 0.06;
+
+        // Anisotropic scale: flat in normal dir (thin), wide tangentially
+        const tang = 0.05 + Math.random() * 0.10;
+        const norm = 0.015 + Math.random() * 0.025;
+        dummy.position.set(x, y, z);
+        dummy.scale.set(tang, norm, tang);
+
+        // Align the ellipsoid's Y-axis (thin axis) to the surface normal
+        normal.set(nx, ny, nz);
+        dummy.quaternion.setFromUnitVectors(yAxis, normal);
+        // Random spin around normal for tangential variety
+        dummy.rotateOnWorldAxis(normal, Math.random() * Math.PI);
+
+        dummy.updateMatrix();
+        cloud.setMatrixAt(i, dummy.matrix);
+
+        // Color: hue from azimuth angle, saturation/lightness with slight randomness.
+        // Adjacent Gaussians share similar hues — mimics view-dependent SH color.
+        const hue = (Math.atan2(nz, nx) / (Math.PI * 2) + 0.5 + ny * 0.15) % 1.0;
+        color.setHSL(hue, 0.65 + Math.random() * 0.25, 0.55 + Math.random() * 0.2);
+        cloud.setColorAt(i, color);
+    }
+
+    cloud.instanceMatrix.needsUpdate = true;
+    if (cloud.instanceColor) cloud.instanceColor.needsUpdate = true;
+
+    return cloud;
+}
 
 /**
  * COLMAP-style camera icon: a simple pyramid (apex + image plane rectangle).
@@ -43,21 +130,17 @@ let distancesBuffer = null;
  * @param {THREE.Vector3} position
  */
 function createCamIcon(position) {
-    // Half-extents of the image plane and pyramid depth (in world units)
     const w = 0.10;
     const h = 0.07;
     const d = 0.18;
 
-    // Pyramid defined in camera-local space: apex at origin, image plane along -Z
-    // (camera convention: looks down -Z)
+    // Pyramid outline (apex at origin, image plane at z = -d in camera-local space)
     /* eslint-disable no-multi-spaces */
     const verts = new Float32Array([
-        // 4 rays: apex → image plane corners
         0,  0,  0,  -w,  h, -d,
         0,  0,  0,   w,  h, -d,
         0,  0,  0,   w, -h, -d,
         0,  0,  0,  -w, -h, -d,
-        // image plane rectangle
         -w,  h, -d,   w,  h, -d,
          w,  h, -d,   w, -h, -d,
          w, -h, -d,  -w, -h, -d,
@@ -65,23 +148,43 @@ function createCamIcon(position) {
     ]);
     /* eslint-enable no-multi-spaces */
 
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-    const icon = new THREE.LineSegments(
-        geo,
-        new THREE.LineBasicMaterial({ color: 0x88c0d0 }) // Nord frost blue
+    const outline = new THREE.LineSegments(
+        new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(verts, 3)),
+        new THREE.LineBasicMaterial({ color: 0x88c0d0 }),
     );
 
-    icon.position.copy(position);
+    // Depth map image plane — initially dark, updated per camera during step 1
+    const canvas = document.createElement('canvas');
+    canvas.width = DEPTH_RES;
+    canvas.height = DEPTH_RES;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#0d1117';
+    ctx.fillRect(0, 0, DEPTH_RES, DEPTH_RES);
+    const texture = new THREE.CanvasTexture(canvas);
 
-    // Use a PerspectiveCamera to get the correct quaternion:
-    // camera.lookAt makes -Z face the target, which matches our geometry above.
+    const imgPlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(w * 2, h * 2),
+        new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide }),
+    );
+    imgPlane.position.set(0, 0, -d);
+
+    const group = new THREE.Group();
+    group.add(outline);
+    group.add(imgPlane);
+
+    // Stored for texture updates from the depth_progress handler
+    group.depthCtx = ctx;
+    group.depthTexture = texture;
+
+    group.position.copy(position);
+
+    // Copy quaternion from a PerspectiveCamera so -Z faces the origin
     const cam = new THREE.PerspectiveCamera();
     cam.position.copy(position);
     cam.lookAt(0, 0, 0);
-    icon.quaternion.copy(cam.quaternion);
+    group.quaternion.copy(cam.quaternion);
 
-    return icon;
+    return group;
 }
 
 init();
@@ -110,6 +213,10 @@ function init() {
     // Helpers
     const gridHelper = new THREE.GridHelper(4, 20, 0x4c566a, 0x3b4252);
     scene.add(gridHelper);
+
+    // Gaussian cloud — represents the 3DGS scene the virtual cameras will scan
+    gaussianCloud = createGaussianCloud(params.type);
+    scene.add(gaussianCloud);
 
     // Virtual Cameras — ring of cameras around the object, each pointing inward
     // This matches the 3DGS → TSDF pipeline: render depth/opacity maps from N viewpoints
@@ -293,30 +400,50 @@ function setupGUI() {
     const gui = new GUI();
     
     gui.add(params, 'showKnowledge').name('💡 Knowledge Base');
+    gui.add(params, 'cameraZoom', 1.5, 12, 0.1).name('🔍 Zoom').onChange(v => {
+        const offset = new THREE.Vector3().subVectors(camera.position, controls.target);
+        offset.setLength(v);
+        camera.position.copy(controls.target).add(offset);
+        controls.update();
+    });
 
     const settings = gui.addFolder('Settings');
-    settings.add(params, 'type', ['sphere', 'torus']).name('Surface Type').onChange(resetDemo);
+    settings.add(params, 'type', ['sphere', 'torus']).name('Surface Type').onChange(v => {
+        scene.remove(gaussianCloud);
+        gaussianCloud = createGaussianCloud(v);
+        scene.add(gaussianCloud);
+        resetDemo();
+    });
+    settings.add(params, 'gaussianCount', 100, 1000, 50).name('Gaussian Count').onChange(() => {
+        scene.remove(gaussianCloud);
+        gaussianCloud = createGaussianCloud(params.type);
+        gaussianCloud.visible = params.showGaussians && currentStep < 5;
+        scene.add(gaussianCloud);
+    });
     settings.add(params, 'mu', 0.05, 0.4).name('Truncation (μ)');
     settings.add(params, 'noise', 0, 0.2).name('Noise');
-    settings.add(params, 'numPoints', 1000, 20000).name('Points Count');
-    
+
     const steps = gui.addFolder('Steps');
-    steps.add(params, 'step1').name('1. Generate Points');
-    steps.add(params, 'step2').name('2. Voxelize');
-    steps.add(params, 'step3').name('3. Fuse Logic');
-    steps.add(params, 'step4').name('4. Extract Mesh');
+    steps.add(params, 'step1').name('1. Render Depth Maps');
+    steps.add(params, 'step2').name('2. Show Point Cloud');
+    steps.add(params, 'step3').name('3. Voxelize');
+    steps.add(params, 'step4').name('4. Fuse Logic');
+    steps.add(params, 'step5').name('5. Extract Mesh');
     steps.add(params, 'reset').name('Reset Everything');
 
     const view = gui.addFolder('Visibility');
-    view.add(params, 'showPoints').name('Show Points').onChange(v => pointCloud.visible = v && currentStep >= 1);
-    view.add(params, 'showVoxels').name('Show Voxels').onChange(v => voxelCloud.visible = v && currentStep >= 2);
+    view.add(params, 'showGaussians').name('Show Gaussians').onChange(v => {
+        gaussianCloud.visible = v && currentStep < 5;
+    });
+    view.add(params, 'showPoints').name('Show Points').onChange(v => pointCloud.visible = v && currentStep >= 2);
+    view.add(params, 'showVoxels').name('Show Voxels').onChange(v => voxelCloud.visible = v && currentStep >= 3);
     view.add(params, 'showMesh').name('Show Mesh').onChange(v => {
-        marchingCubes.visible = v && currentStep === 4;
-        marchingWireframe.visible = v && currentStep === 4;
+        marchingCubes.visible = v && currentStep === 5;
+        marchingWireframe.visible = v && currentStep === 5;
     });
     view.add(params, 'showCamera').name('Show Camera').onChange(v => cameraHelpers.forEach(h => h.visible = v));
     view.add(params, 'showSlice').name('Show Slice').onChange(v => {
-        slicePlane.visible = v && currentStep >= 3;
+        slicePlane.visible = v && currentStep >= 4;
         if (v && distancesBuffer) updateSliceTexture(distancesBuffer);
     });
     view.add(params, 'slicePos', -1.9, 1.9).name('Slice Position').onChange(() => {
@@ -335,13 +462,50 @@ function initWorker() {
         const { type, data } = e.data;
         switch (type) {
             case 'ready': updateStatus('System Ready. Start with Step 1.'); break;
-            case 'points': renderPoints(data); updateStatus('Step 1 Complete: Points Generated.'); break;
-            case 'voxels': renderVoxels(data); updateStatus('Step 2 Complete: Affected Voxels Identified.'); break;
+
+            // Step 1: one depth map per camera arrives progressively
+            case 'depth_progress': {
+                const { camIndex, depthMap } = data;
+                const icon = cameraHelpers[camIndex];
+                if (!icon?.depthCtx) break;
+
+                const ctx = icon.depthCtx;
+                const imgData = ctx.createImageData(DEPTH_RES, DEPTH_RES);
+                let minD = Infinity, maxD = -Infinity;
+                for (let i = 0; i < depthMap.length; i++) {
+                    if (depthMap[i] >= 0) { minD = Math.min(minD, depthMap[i]); maxD = Math.max(maxD, depthMap[i]); }
+                }
+                for (let i = 0; i < depthMap.length; i++) {
+                    const d = depthMap[i];
+                    const idx = i * 4;
+                    if (d < 0) {
+                        imgData.data[idx] = 13; imgData.data[idx + 1] = 17; imgData.data[idx + 2] = 23; imgData.data[idx + 3] = 200;
+                    } else {
+                        // near = bright, far = dark (standard depth map convention)
+                        const t = maxD > minD ? 1 - (d - minD) / (maxD - minD) : 0.5;
+                        const v = Math.floor(t * 255);
+                        imgData.data[idx] = v; imgData.data[idx + 1] = v; imgData.data[idx + 2] = v; imgData.data[idx + 3] = 255;
+                    }
+                }
+                ctx.putImageData(imgData, 0, 0);
+                icon.depthTexture.needsUpdate = true;
+                updateStatus(`Step 1: Rendering depth maps... camera ${camIndex + 1} / ${cameraHelpers.length}`);
+                break;
+            }
+
+            // Step 1 complete: store points, do NOT show yet (step 2 reveals them)
+            case 'points':
+                pendingPoints = data;
+                updateStatus('Step 1 Complete: All depth maps rendered. Run Step 2 to reveal point cloud.');
+                break;
+
+            case 'voxels': renderVoxels(data); updateStatus('Step 3 Complete: Affected Voxels Identified.'); break;
+
             case 'fusing_progress': {
                 const percent = (data.progress * 100).toFixed(0);
-                updateStatus(`Step 3: Fusing Logic... ${percent}%`);
+                updateStatus(`Step 4: Fusing Logic... ${percent}%`);
 
-                // Step 3 focuses on the TSDF distance field — force slice plane, hide mesh
+                // Step 4 focuses on the TSDF distance field — force slice plane, hide mesh
                 marchingCubes.visible = false;
                 marchingWireframe.visible = false;
                 slicePlane.visible = true;
@@ -349,27 +513,43 @@ function initWorker() {
 
                 if (data.isDone) {
                     distancesBuffer = data.distances;
-                    updateStatus(`Step 3 Complete: TSDF field built in ${data.time.toFixed(2)}ms. Run Step 4 to extract mesh.`);
+                    updateStatus(`Step 4 Complete: TSDF field built in ${data.time.toFixed(2)}ms. Run Step 5 to extract mesh.`);
                 }
                 break;
             }
+
             case 'extracted':
                 distancesBuffer = data;
-                // Step 4 focuses on the extracted mesh — hide field, show solid + wireframe
+                // Step 5: Gaussians → Mesh — the key visual transformation
+                gaussianCloud.visible = false; // always hide regardless of showGaussians toggle
                 slicePlane.visible = false;
                 renderMesh(data);
                 marchingCubes.visible = params.showMesh;
                 marchingWireframe.visible = params.showMesh;
-                updateStatus('Step 4 Complete: Mesh Extracted via Marching Cubes.');
+                updateStatus('Step 5 Complete: Mesh Extracted via Marching Cubes.');
                 break;
+
             case 'reset_done':
                 currentStep = 0;
+                pendingPoints = null;
+                scene.remove(gaussianCloud);
+                gaussianCloud = createGaussianCloud(params.type);
+                gaussianCloud.visible = params.showGaussians;
+                scene.add(gaussianCloud);
                 pointCloud.visible = false;
                 voxelCloud.visible = false;
                 marchingCubes.visible = false;
                 marchingWireframe.visible = false;
                 slicePlane.visible = false;
-                cameraHelpers.forEach(h => h.visible = params.showCamera);
+                cameraHelpers.forEach(h => {
+                    h.visible = params.showCamera;
+                    // Clear depth map texture
+                    if (h.depthCtx) {
+                        h.depthCtx.fillStyle = '#0d1117';
+                        h.depthCtx.fillRect(0, 0, DEPTH_RES, DEPTH_RES);
+                        h.depthTexture.needsUpdate = true;
+                    }
+                });
                 distancesBuffer = null;
                 updateStatus('Reset Complete. Ready for Step 1.');
                 break;
@@ -381,21 +561,27 @@ function triggerStep(step) {
     if (step === 1) {
         currentStep = 1;
         sendInitToWorker();
-        worker.postMessage({ type: 'step1_generate' });
+        worker.postMessage({ type: 'step1_render' });
     } else if (step === 2) {
-        if (currentStep < 1) return updateStatus('Error: Please generate points first (Step 1).');
+        if (currentStep < 1) return updateStatus('Error: Complete Step 1 first.');
+        if (!pendingPoints) return updateStatus('Error: Step 1 not finished yet.');
         currentStep = 2;
-        worker.postMessage({ type: 'step2_voxelize' });
+        renderPoints(pendingPoints);
+        updateStatus('Step 2 Complete: Point cloud from depth map back-projection.');
     } else if (step === 3) {
-        if (currentStep < 2) return updateStatus('Error: Please run voxelization first (Step 2).');
+        if (currentStep < 2) return updateStatus('Error: Complete Step 2 first.');
         currentStep = 3;
+        worker.postMessage({ type: 'step3_voxelize' });
+    } else if (step === 4) {
+        if (currentStep < 3) return updateStatus('Error: Complete Step 3 first.');
+        currentStep = 4;
         marchingCubes.visible = false;
         marchingWireframe.visible = false;
-        worker.postMessage({ type: 'step3_fuse' });
-    } else if (step === 4) {
-        if (currentStep < 3) return updateStatus('Error: Please run fusion first (Step 3).');
-        currentStep = 4;
-        worker.postMessage({ type: 'step4_extract' });
+        worker.postMessage({ type: 'step4_fuse' });
+    } else if (step === 5) {
+        if (currentStep < 4) return updateStatus('Error: Complete Step 4 first.');
+        currentStep = 5;
+        worker.postMessage({ type: 'step5_extract' });
     }
 }
 
@@ -428,17 +614,16 @@ function resetDemo() {
 }
 
 function sendInitToWorker() {
-    worker.postMessage({ 
-        type: 'init', 
-        data: { 
-            size: params.resolution, 
-            extent: 2.0, 
+    worker.postMessage({
+        type: 'init',
+        data: {
+            size: params.resolution,
+            extent: 2.0,
             mu: params.mu,
             type: params.type,
-            numPoints: params.numPoints,
             noise: params.noise,
-            outliers: params.outliers
-        } 
+            outliers: params.outliers,
+        },
     });
 }
 

@@ -1,9 +1,17 @@
 import { TSDFVolume } from './tsdf.js';
-import { SurfaceSampler } from './sampling.js';
 
 let volume = null;
-let sampler = null;
 let currentPoints = null;
+let sceneType = 'sphere';
+let noiseStd = 0.02;
+let outlierRate = 0.05;
+
+/** Must match the constants in main.js */
+const CAM_COUNT = 8;
+const CAM_RADIUS = 2.5;
+const CAM_HEIGHT = 1.0;
+const CAM_FOV_DEG = 45;
+export const DEPTH_RES = 48; // exported so main.js can import for canvas size
 
 self.onmessage = (e) => {
     const { type, data } = e.data;
@@ -11,37 +19,32 @@ self.onmessage = (e) => {
     switch (type) {
         case 'init':
             volume = new TSDFVolume(data);
-            sampler = new SurfaceSampler(data);
+            sceneType = data.type || 'sphere';
+            noiseStd = data.noise || 0.02;
+            outlierRate = data.outliers || 0.05;
+            currentPoints = null;
             self.postMessage({ type: 'ready' });
             break;
 
-        case 'step1_generate':
-            // State: Point Cloud Generation
-            currentPoints = sampler.generate();
-            // We send a copy so we can keep currentPoints in worker memory
-            self.postMessage({ type: 'points', data: currentPoints });
+        case 'step1_render':
+            renderDepthMapsProgressive();
             break;
 
-        case 'step2_voxelize':
-            // State: Voxelization (Finding affected voxels)
+        case 'step3_voxelize':
             if (volume && currentPoints) {
-                const affectedVoxels = getAffectedVoxels(volume, currentPoints);
-                self.postMessage({ type: 'voxels', data: affectedVoxels });
+                self.postMessage({ type: 'voxels', data: getAffectedVoxels(volume, currentPoints) });
             }
             break;
 
-        case 'step3_fuse':
-            // State: Progressive Fusion Logic
+        case 'step4_fuse':
             if (volume && currentPoints) {
                 fuseProgressive(volume, currentPoints);
             }
             break;
 
-        case 'step4_extract':
-            // State: Marching Cubes
+        case 'step5_extract':
             if (volume) {
-                const distances = volume.getGridData();
-                self.postMessage({ type: 'extracted', data: distances });
+                self.postMessage({ type: 'extracted', data: volume.getGridData() });
             }
             break;
 
@@ -49,17 +52,226 @@ self.onmessage = (e) => {
             if (volume) {
                 volume.distances.fill(1.0);
                 volume.weights.fill(0.0);
-                currentPoints = null;
-                self.postMessage({ type: 'reset_done' });
             }
+            currentPoints = null;
+            self.postMessage({ type: 'reset_done' });
             break;
     }
 };
 
+// ---------------------------------------------------------------------------
+// Step 1: depth map rendering + back-projection
+// ---------------------------------------------------------------------------
+
+/**
+ * Build { pos, fwd, right, up } axes for camera at ring index camIdx.
+ * All vectors are plain arrays [x, y, z].
+ */
+function getCameraAxes(camIdx) {
+    const angle = (camIdx / CAM_COUNT) * Math.PI * 2;
+    const pos = [
+        CAM_RADIUS * Math.cos(angle),
+        CAM_HEIGHT,
+        CAM_RADIUS * Math.sin(angle),
+    ];
+    const L = Math.sqrt(pos[0] ** 2 + pos[1] ** 2 + pos[2] ** 2);
+    const fwd = [-pos[0] / L, -pos[1] / L, -pos[2] / L]; // toward origin
+
+    // right = normalize(fwd × worldUp), worldUp = (0,1,0)
+    // fwd × (0,1,0) = (-fwd[2], 0, fwd[0])
+    const rx = -fwd[2], rz = fwd[0];
+    const rLen = Math.sqrt(rx * rx + rz * rz);
+    const right = [rx / rLen, 0, rz / rLen];
+
+    // up = right × fwd (always unit length given our geometry)
+    const ux = right[1] * fwd[2] - right[2] * fwd[1];
+    const uy = right[2] * fwd[0] - right[0] * fwd[2];
+    const uz = right[0] * fwd[1] - right[1] * fwd[0];
+    const uLen = Math.sqrt(ux * ux + uy * uy + uz * uz);
+
+    return { pos, fwd, right, up: [ux / uLen, uy / uLen, uz / uLen] };
+}
+
+async function renderDepthMapsProgressive() {
+    const halfFOV = (CAM_FOV_DEG * Math.PI / 180) / 2;
+    const tanFOV = Math.tan(halfFOV);
+    const allPoints = [];
+
+    for (let camIdx = 0; camIdx < CAM_COUNT; camIdx++) {
+        const { pos, fwd, right, up } = getCameraAxes(camIdx);
+        const depthMap = new Float32Array(DEPTH_RES * DEPTH_RES).fill(-1);
+
+        for (let py = 0; py < DEPTH_RES; py++) {
+            for (let px = 0; px < DEPTH_RES; px++) {
+                const ndcX = (px + 0.5) / DEPTH_RES * 2 - 1;
+                const ndcY = 1 - (py + 0.5) / DEPTH_RES * 2;
+
+                // Build ray direction in world space
+                const rdx = fwd[0] + ndcX * tanFOV * right[0] + ndcY * tanFOV * up[0];
+                const rdy = fwd[1] + ndcX * tanFOV * right[1] + ndcY * tanFOV * up[1];
+                const rdz = fwd[2] + ndcX * tanFOV * right[2] + ndcY * tanFOV * up[2];
+                const rdLen = Math.sqrt(rdx ** 2 + rdy ** 2 + rdz ** 2);
+                const dir = [rdx / rdLen, rdy / rdLen, rdz / rdLen];
+
+                const t = sceneType === 'sphere'
+                    ? raySphere(pos, dir)
+                    : rayTorus(pos, dir);
+
+                if (t < 0) continue;
+
+                depthMap[py * DEPTH_RES + px] = t;
+
+                // Back-project hit point
+                const hx = pos[0] + t * dir[0];
+                const hy = pos[1] + t * dir[1];
+                const hz = pos[2] + t * dir[2];
+
+                // Surface normal
+                let nx, ny, nz;
+                if (sceneType === 'sphere') {
+                    const nLen = Math.sqrt(hx ** 2 + hy ** 2 + hz ** 2);
+                    nx = hx / nLen; ny = hy / nLen; nz = hz / nLen;
+                } else {
+                    // Numerical SDF gradient
+                    const eps = 0.001;
+                    const gx = sdTorus([hx + eps, hy, hz]) - sdTorus([hx - eps, hy, hz]);
+                    const gy = sdTorus([hx, hy + eps, hz]) - sdTorus([hx, hy - eps, hz]);
+                    const gz = sdTorus([hx, hy, hz + eps]) - sdTorus([hx, hy, hz - eps]);
+                    const gLen = Math.sqrt(gx ** 2 + gy ** 2 + gz ** 2);
+                    nx = gx / gLen; ny = gy / gLen; nz = gz / gLen;
+                }
+
+                // Flip normal if it points away from camera
+                if (nx * (-dir[0]) + ny * (-dir[1]) + nz * (-dir[2]) < 0) {
+                    nx = -nx; ny = -ny; nz = -nz;
+                }
+
+                allPoints.push(
+                    hx + gaussianRandom() * noiseStd,
+                    hy + gaussianRandom() * noiseStd,
+                    hz + gaussianRandom() * noiseStd,
+                    nx, ny, nz, 1.0,
+                );
+            }
+        }
+
+        self.postMessage({ type: 'depth_progress', data: { camIndex: camIdx, depthMap } });
+        await new Promise(r => setTimeout(r, 60));
+    }
+
+    // Add outliers to simulate 3DGS floaters
+    const numOutliers = Math.floor(allPoints.length / 7 * outlierRate);
+    for (let i = 0; i < numOutliers; i++) {
+        const ox = (Math.random() - 0.5) * 4;
+        const oy = (Math.random() - 0.5) * 4;
+        const oz = (Math.random() - 0.5) * 4;
+        let onx = Math.random() - 0.5;
+        let ony = Math.random() - 0.5;
+        let onz = Math.random() - 0.5;
+        const onLen = Math.sqrt(onx ** 2 + ony ** 2 + onz ** 2);
+        allPoints.push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, 1.0);
+    }
+
+    currentPoints = new Float32Array(allPoints);
+    self.postMessage({ type: 'points', data: currentPoints });
+}
+
+// ---------------------------------------------------------------------------
+// Ray intersection helpers
+// ---------------------------------------------------------------------------
+
+/** Analytic ray-sphere intersection. Returns t ≥ 0, or -1 on miss. */
+function raySphere(ro, rd, radius = 1.0) {
+    const b = 2 * (ro[0] * rd[0] + ro[1] * rd[1] + ro[2] * rd[2]);
+    const c = ro[0] ** 2 + ro[1] ** 2 + ro[2] ** 2 - radius ** 2;
+    const disc = b * b - 4 * c;
+    if (disc < 0) return -1;
+    const sq = Math.sqrt(disc);
+    const t1 = (-b - sq) / 2;
+    const t2 = (-b + sq) / 2;
+    if (t2 < 0) return -1;
+    return t1 >= 0 ? t1 : t2;
+}
+
+/** Torus SDF: major radius R=1.0, minor radius r=0.4 */
+function sdTorus(p) {
+    const q = Math.sqrt(p[0] ** 2 + p[2] ** 2) - 1.0;
+    return Math.sqrt(q ** 2 + p[1] ** 2) - 0.4;
+}
+
+/** Ray-march against torus SDF. Returns t ≥ 0, or -1 on miss. */
+function rayTorus(ro, rd) {
+    let t = 0;
+    for (let i = 0; i < 150; i++) {
+        const p = [ro[0] + t * rd[0], ro[1] + t * rd[1], ro[2] + t * rd[2]];
+        const d = sdTorus(p);
+        if (Math.abs(d) < 0.001) return t;
+        t += d * 0.9; // slight under-stepping for robustness
+        if (t > 12) return -1;
+    }
+    return -1;
+}
+
+/** Box-Muller Gaussian noise */
+function gaussianRandom() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: Voxelization
+// ---------------------------------------------------------------------------
+
+function getAffectedVoxels(vol, points) {
+    const numPoints = points.length / 7;
+    const affectedIndices = new Set();
+    const { voxelSize, extent, size, range } = vol;
+
+    for (let i = 0; i < numPoints; i++) {
+        const px = points[i * 7];
+        const py = points[i * 7 + 1];
+        const pz = points[i * 7 + 2];
+
+        const nix = Math.floor((px + extent) / voxelSize);
+        const niy = Math.floor((py + extent) / voxelSize);
+        const niz = Math.floor((pz + extent) / voxelSize);
+
+        for (let dx = -range; dx <= range; dx++) {
+            for (let dy = -range; dy <= range; dy++) {
+                for (let dz = -range; dz <= range; dz++) {
+                    const ix = nix + dx;
+                    const iy = niy + dy;
+                    const iz = niz + dz;
+                    if (ix < 0 || ix >= size || iy < 0 || iy >= size || iz < 0 || iz >= size) continue;
+                    affectedIndices.add(ix + iy * size + iz * vol.sizeSq);
+                }
+            }
+        }
+    }
+
+    const centers = new Float32Array(affectedIndices.size * 3);
+    let count = 0;
+    for (const idx of affectedIndices) {
+        const iz = Math.floor(idx / vol.sizeSq);
+        const iy = Math.floor((idx % vol.sizeSq) / size);
+        const ix = idx % size;
+        centers[count * 3]     = (ix + 0.5) * voxelSize - extent;
+        centers[count * 3 + 1] = (iy + 0.5) * voxelSize - extent;
+        centers[count * 3 + 2] = (iz + 0.5) * voxelSize - extent;
+        count++;
+    }
+    return centers;
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: Progressive TSDF fusion
+// ---------------------------------------------------------------------------
+
 async function fuseProgressive(vol, points) {
     const numPoints = points.length / 7;
     const chunkSize = 500;
-    // Send a visual update every N chunks to halve postMessage overhead
     const reportEvery = 2;
     const startTime = performance.now();
     let chunkIndex = 0;
@@ -84,58 +296,4 @@ async function fuseProgressive(vol, points) {
 
         await new Promise(r => setTimeout(r, 80));
     }
-}
-
-/**
- * Returns the centers of voxels that are within the truncation distance of any point
- */
-function getAffectedVoxels(vol, points) {
-    const numPoints = points.length / 7;
-    const affectedIndices = new Set();
-    const voxelSize = vol.voxelSize;
-    const extent = vol.extent;
-    const size = vol.size;
-    const mu = vol.mu;
-
-    for (let i = 0; i < numPoints; i++) {
-        const px = points[i * 7];
-        const py = points[i * 7 + 1];
-        const pz = points[i * 7 + 2];
-        
-        const range = Math.ceil(mu / voxelSize);
-        const nix = Math.floor((px + extent) / voxelSize);
-        const niy = Math.floor((py + extent) / voxelSize);
-        const niz = Math.floor((pz + extent) / voxelSize);
-
-        for (let dx = -range; dx <= range; dx++) {
-            for (let dy = -range; dy <= range; dy++) {
-                for (let dz = -range; dz <= range; dz++) {
-                    const ix = nix + dx;
-                    const iy = niy + dy;
-                    const iz = niz + dz;
-
-                    if (ix < 0 || ix >= size || iy < 0 || iy >= size || iz < 0 || iz >= size) continue;
-
-                    const idx = ix + iy * size + iz * size * size;
-                    affectedIndices.add(idx);
-                }
-            }
-        }
-    }
-
-    // Convert indices to centers for visualization
-    const centers = new Float32Array(affectedIndices.size * 3);
-    let count = 0;
-    for (const idx of affectedIndices) {
-        const iz = Math.floor(idx / (size * size));
-        const iy = Math.floor((idx % (size * size)) / size);
-        const ix = idx % size;
-
-        centers[count * 3] = (ix + 0.5) * voxelSize - extent;
-        centers[count * 3 + 1] = (iy + 0.5) * voxelSize - extent;
-        centers[count * 3 + 2] = (iz + 0.5) * voxelSize - extent;
-        count++;
-    }
-
-    return centers;
 }
