@@ -31,11 +31,58 @@ const params = {
 };
 
 let scene, camera, renderer, controls;
-let marchingCubes, pointCloud, voxelCloud, slicePlane;
-let virtualCamera, cameraHelper;
+let marchingCubes, marchingWireframe, pointCloud, voxelCloud, slicePlane;
+let cameraHelpers = [];
 let worker;
 let currentStep = 0;
 let distancesBuffer = null;
+
+/**
+ * COLMAP-style camera icon: a simple pyramid (apex + image plane rectangle).
+ * Apex at the given position, pyramid opens toward the scene origin.
+ * @param {THREE.Vector3} position
+ */
+function createCamIcon(position) {
+    // Half-extents of the image plane and pyramid depth (in world units)
+    const w = 0.10;
+    const h = 0.07;
+    const d = 0.18;
+
+    // Pyramid defined in camera-local space: apex at origin, image plane along -Z
+    // (camera convention: looks down -Z)
+    /* eslint-disable no-multi-spaces */
+    const verts = new Float32Array([
+        // 4 rays: apex → image plane corners
+        0,  0,  0,  -w,  h, -d,
+        0,  0,  0,   w,  h, -d,
+        0,  0,  0,   w, -h, -d,
+        0,  0,  0,  -w, -h, -d,
+        // image plane rectangle
+        -w,  h, -d,   w,  h, -d,
+         w,  h, -d,   w, -h, -d,
+         w, -h, -d,  -w, -h, -d,
+        -w, -h, -d,  -w,  h, -d,
+    ]);
+    /* eslint-enable no-multi-spaces */
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    const icon = new THREE.LineSegments(
+        geo,
+        new THREE.LineBasicMaterial({ color: 0x88c0d0 }) // Nord frost blue
+    );
+
+    icon.position.copy(position);
+
+    // Use a PerspectiveCamera to get the correct quaternion:
+    // camera.lookAt makes -Z face the target, which matches our geometry above.
+    const cam = new THREE.PerspectiveCamera();
+    cam.position.copy(position);
+    cam.lookAt(0, 0, 0);
+    icon.quaternion.copy(cam.quaternion);
+
+    return icon;
+}
 
 init();
 
@@ -64,13 +111,23 @@ function init() {
     const gridHelper = new THREE.GridHelper(4, 20, 0x4c566a, 0x3b4252);
     scene.add(gridHelper);
 
-    // Virtual Camera (Frustum)
-    virtualCamera = new THREE.PerspectiveCamera(45, 1, 0.5, 3.5);
-    virtualCamera.position.set(2.5, 1.5, 2.5);
-    virtualCamera.lookAt(0, 0, 0);
-    cameraHelper = new THREE.CameraHelper(virtualCamera);
-    cameraHelper.visible = params.showCamera;
-    scene.add(cameraHelper);
+    // Virtual Cameras — ring of cameras around the object, each pointing inward
+    // This matches the 3DGS → TSDF pipeline: render depth/opacity maps from N viewpoints
+    const CAM_COUNT = 8;
+    const CAM_RADIUS = 2.5;
+    const CAM_HEIGHT = 1.0;
+    for (let i = 0; i < CAM_COUNT; i++) {
+        const angle = (i / CAM_COUNT) * Math.PI * 2;
+        const pos = new THREE.Vector3(
+            CAM_RADIUS * Math.cos(angle),
+            CAM_HEIGHT,
+            CAM_RADIUS * Math.sin(angle)
+        );
+        const icon = createCamIcon(pos);
+        icon.visible = params.showCamera;
+        scene.add(icon);
+        cameraHelpers.push(icon);
+    }
 
     // Step 4: Mesh (Marching Cubes)
     const material = new THREE.MeshPhongMaterial({ 
@@ -84,9 +141,18 @@ function init() {
     });
     
     marchingCubes = new MarchingCubes(params.resolution, material, true, true, 100000);
-    marchingCubes.scale.set(2, 2, 2); 
+    marchingCubes.scale.set(2, 2, 2);
     marchingCubes.visible = false;
     scene.add(marchingCubes);
+
+    // Step 4 wireframe overlay — shares geometry with marchingCubes so it updates automatically
+    marchingWireframe = new THREE.Mesh(
+        marchingCubes.geometry,
+        new THREE.MeshBasicMaterial({ color: 0x4c566a, wireframe: true, transparent: true, opacity: 0.35 })
+    );
+    marchingWireframe.scale.set(2, 2, 2);
+    marchingWireframe.visible = false;
+    scene.add(marchingWireframe);
 
     // Step 1: Point Cloud
     const pcMaterial = new THREE.PointsMaterial({ 
@@ -244,8 +310,11 @@ function setupGUI() {
     const view = gui.addFolder('Visibility');
     view.add(params, 'showPoints').name('Show Points').onChange(v => pointCloud.visible = v && currentStep >= 1);
     view.add(params, 'showVoxels').name('Show Voxels').onChange(v => voxelCloud.visible = v && currentStep >= 2);
-    view.add(params, 'showMesh').name('Show Mesh').onChange(v => marchingCubes.visible = v && currentStep >= 3);
-    view.add(params, 'showCamera').name('Show Camera').onChange(v => cameraHelper.visible = v);
+    view.add(params, 'showMesh').name('Show Mesh').onChange(v => {
+        marchingCubes.visible = v && currentStep === 4;
+        marchingWireframe.visible = v && currentStep === 4;
+    });
+    view.add(params, 'showCamera').name('Show Camera').onChange(v => cameraHelpers.forEach(h => h.visible = v));
     view.add(params, 'showSlice').name('Show Slice').onChange(v => {
         slicePlane.visible = v && currentStep >= 3;
         if (v && distancesBuffer) updateSliceTexture(distancesBuffer);
@@ -268,35 +337,39 @@ function initWorker() {
             case 'ready': updateStatus('System Ready. Start with Step 1.'); break;
             case 'points': renderPoints(data); updateStatus('Step 1 Complete: Points Generated.'); break;
             case 'voxels': renderVoxels(data); updateStatus('Step 2 Complete: Affected Voxels Identified.'); break;
-            case 'fusing_progress':
+            case 'fusing_progress': {
                 const percent = (data.progress * 100).toFixed(0);
                 updateStatus(`Step 3: Fusing Logic... ${percent}%`);
-                
-                // Show mesh during fusion if enabled
-                marchingCubes.visible = params.showMesh;
-                renderMesh(data.distances);
-                if (params.showSlice) updateSliceTexture(data.distances);
-                
+
+                // Step 3 focuses on the TSDF distance field — force slice plane, hide mesh
+                marchingCubes.visible = false;
+                marchingWireframe.visible = false;
+                slicePlane.visible = true;
+                updateSliceTexture(data.distances);
+
                 if (data.isDone) {
                     distancesBuffer = data.distances;
-                    updateStatus(`Step 3 Complete: TSDF Fusion done in ${data.time.toFixed(2)}ms.`);
+                    updateStatus(`Step 3 Complete: TSDF field built in ${data.time.toFixed(2)}ms. Run Step 4 to extract mesh.`);
                 }
                 break;
+            }
             case 'extracted':
                 distancesBuffer = data;
-                if (currentStep === 4) {
-                    renderMesh(data);
-                    updateStatus('Step 4 Complete: Mesh Extracted via Marching Cubes.');
-                }
-                if (params.showSlice) updateSliceTexture(data);
+                // Step 4 focuses on the extracted mesh — hide field, show solid + wireframe
+                slicePlane.visible = false;
+                renderMesh(data);
+                marchingCubes.visible = params.showMesh;
+                marchingWireframe.visible = params.showMesh;
+                updateStatus('Step 4 Complete: Mesh Extracted via Marching Cubes.');
                 break;
             case 'reset_done':
                 currentStep = 0;
                 pointCloud.visible = false;
                 voxelCloud.visible = false;
                 marchingCubes.visible = false;
+                marchingWireframe.visible = false;
                 slicePlane.visible = false;
-                cameraHelper.visible = params.showCamera;
+                cameraHelpers.forEach(h => h.visible = params.showCamera);
                 distancesBuffer = null;
                 updateStatus('Reset Complete. Ready for Step 1.');
                 break;
@@ -316,6 +389,8 @@ function triggerStep(step) {
     } else if (step === 3) {
         if (currentStep < 2) return updateStatus('Error: Please run voxelization first (Step 2).');
         currentStep = 3;
+        marchingCubes.visible = false;
+        marchingWireframe.visible = false;
         worker.postMessage({ type: 'step3_fuse' });
     } else if (step === 4) {
         if (currentStep < 3) return updateStatus('Error: Please run fusion first (Step 3).');
@@ -345,7 +420,7 @@ function renderMesh(distances) {
     marchingCubes.field.set(distances);
     marchingCubes.isolation = 0.0;
     marchingCubes.update();
-    marchingCubes.visible = params.showMesh;
+    // marchingWireframe shares the same geometry and updates automatically
 }
 
 function resetDemo() {
