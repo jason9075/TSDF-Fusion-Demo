@@ -17,6 +17,7 @@ const params = {
     showVoxels: true,
     showMesh: true,
     showSlice: false,
+    showCamera: true,
     showKnowledge: () => toggleModal(true),
     slicePos: 0.0,
     type: 'sphere',
@@ -31,6 +32,7 @@ const params = {
 
 let scene, camera, renderer, controls;
 let marchingCubes, pointCloud, voxelCloud, slicePlane;
+let virtualCamera, cameraHelper;
 let worker;
 let currentStep = 0;
 let distancesBuffer = null;
@@ -61,6 +63,14 @@ function init() {
     // Helpers
     const gridHelper = new THREE.GridHelper(4, 20, 0x4c566a, 0x3b4252);
     scene.add(gridHelper);
+
+    // Virtual Camera (Frustum)
+    virtualCamera = new THREE.PerspectiveCamera(45, 1, 0.5, 3.5);
+    virtualCamera.position.set(2.5, 1.5, 2.5);
+    virtualCamera.lookAt(0, 0, 0);
+    cameraHelper = new THREE.CameraHelper(virtualCamera);
+    cameraHelper.visible = params.showCamera;
+    scene.add(cameraHelper);
 
     // Step 4: Mesh (Marching Cubes)
     const material = new THREE.MeshPhongMaterial({ 
@@ -283,7 +293,8 @@ function setupGUI() {
     const view = gui.addFolder('Visibility');
     view.add(params, 'showPoints').name('Show Points').onChange(v => pointCloud.visible = v && currentStep >= 1);
     view.add(params, 'showVoxels').name('Show Voxels').onChange(v => voxelCloud.visible = v && currentStep >= 2);
-    view.add(params, 'showMesh').name('Show Mesh').onChange(v => marchingCubes.visible = v && currentStep >= 4);
+    view.add(params, 'showMesh').name('Show Mesh').onChange(v => marchingCubes.visible = v && currentStep >= 3);
+    view.add(params, 'showCamera').name('Show Camera').onChange(v => cameraHelper.visible = v);
     view.add(params, 'showSlice').name('Show Slice').onChange(v => {
         slicePlane.visible = v && currentStep >= 3;
         if (v && distancesBuffer) updateSliceTexture(distancesBuffer);
@@ -306,9 +317,19 @@ function initWorker() {
             case 'ready': updateStatus('System Ready. Start with Step 1.'); break;
             case 'points': renderPoints(data); updateStatus('Step 1 Complete: Points Generated.'); break;
             case 'voxels': renderVoxels(data); updateStatus('Step 2 Complete: Affected Voxels Identified.'); break;
-            case 'fused': 
-                updateStatus(`Step 3 Complete: TSDF Fusion done in ${data.time.toFixed(2)}ms.`); 
-                worker.postMessage({ type: 'step4_extract' }); // Get data for slice but don't show mesh yet
+            case 'fusing_progress':
+                const percent = (data.progress * 100).toFixed(0);
+                updateStatus(`Step 3: Fusing Logic... ${percent}%`);
+                
+                // Show mesh during fusion if enabled
+                marchingCubes.visible = params.showMesh;
+                renderMesh(data.distances);
+                if (params.showSlice) updateSliceTexture(data.distances);
+                
+                if (data.isDone) {
+                    distancesBuffer = data.distances;
+                    updateStatus(`Step 3 Complete: TSDF Fusion done in ${data.time.toFixed(2)}ms.`);
+                }
                 break;
             case 'extracted':
                 distancesBuffer = data;
@@ -324,6 +345,7 @@ function initWorker() {
                 voxelCloud.visible = false;
                 marchingCubes.visible = false;
                 slicePlane.visible = false;
+                cameraHelper.visible = params.showCamera;
                 distancesBuffer = null;
                 updateStatus('Reset Complete. Ready for Step 1.');
                 break;

@@ -31,18 +31,9 @@ self.onmessage = (e) => {
             break;
 
         case 'step3_fuse':
-            // State: Fusion Logic
+            // State: Progressive Fusion Logic
             if (volume && currentPoints) {
-                const startTime = performance.now();
-                volume.fuse(currentPoints);
-                const endTime = performance.now();
-                
-                self.postMessage({ 
-                    type: 'fused', 
-                    data: {
-                        time: endTime - startTime
-                    }
-                });
+                fuseProgressive(volume, currentPoints);
             }
             break;
 
@@ -64,6 +55,37 @@ self.onmessage = (e) => {
             break;
     }
 };
+
+async function fuseProgressive(vol, points) {
+    const numPoints = points.length / 7;
+    const chunkSize = 500;
+    const startTime = performance.now();
+
+    for (let i = 0; i < numPoints; i += chunkSize) {
+        const end = Math.min(i + chunkSize, numPoints);
+        const chunk = points.subarray(i * 7, end * 7);
+        
+        vol.fuse(chunk);
+
+        // Send intermediate result for visualization
+        const distances = vol.getGridData();
+        const progress = end / numPoints;
+        
+        self.postMessage({ 
+            type: 'fusing_progress', 
+            data: {
+                distances: distances,
+                progress: progress,
+                isDone: end === numPoints,
+                time: performance.now() - startTime
+            }
+        });
+
+        // Small yield to let worker handle other things if needed 
+        // and simulate gradual growth for humans to see
+        await new Promise(r => setTimeout(r, 80)); 
+    }
+}
 
 /**
  * Returns the centers of voxels that are within the truncation distance of any point

@@ -97,15 +97,18 @@
                         <ol class="lang-en">
                             <li><strong>Point Generation</strong>: Sampling surface points from implicit kernels.</li>
                             <li><strong>Voxelization</strong>: Projecting points into the 3D grid and identifying affected voxels.</li>
-                            <li><strong>Fusion</strong>: Integrating distances into the volume using the formulas above.</li>
-                            <li><strong>Marching Cubes</strong>: Extracting an explicit triangle mesh from the zero-crossing of the TSDF field.</li>
+                            <li><strong>Fusion (Integration)</strong>: A weighted averaging process (Statistics). This updates the invisible distance field.</li>
+                            <li><strong>Marching Cubes (Extraction)</strong>: A geometric process (Topology) that creates a mesh from the field.</li>
                         </ol>
+                        <p class="lang-en" style="font-size: 0.8rem; font-style: italic; opacity: 0.7;">Note: In real-time systems, Step 4 is often run repeatedly during Step 3 to provide visual feedback, though they are technically distinct algorithms.</p>
+                        
                         <ol class="lang-zh hidden">
                             <li><strong>點雲生成 (Point Generation)</strong>：從隱式內核中採樣表面點。</li>
                             <li><strong>體素化 (Voxelization)</strong>：將點投影到 3D 網格並識別受影響的體素。</li>
-                            <li><strong>融合 (Fusion)</strong>：使用上述公式將距離資訊整合進體積中。</li>
-                            <li><strong>移動立方體 (Marching Cubes)</strong>：從 TSDF 場的零交叉點提取出顯式的三角形網格。</li>
+                            <li><strong>融合 (Fusion)</strong>：統計學過程，將觀測值整合進不可見的數值場中。</li>
+                            <li><strong>移動立方體 (Marching Cubes)</strong>：幾何學過程，從數值場中提取出可見的網格。</li>
                         </ol>
+                        <p class="lang-zh hidden" style="font-size: 0.8rem; font-style: italic; opacity: 0.7;">註：在即時系統中，為了提供視覺回饋，通常會在第三步執行期間不斷重複第四步，雖然兩者在技術上是獨立的演算法。</p>
                     </section>
                 </div>
             </div>
