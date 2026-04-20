@@ -183,8 +183,17 @@
                                         <li>Smaller μ → sharper surfaces, but gaps may appear where surface coverage is thin.</li>
                                     </ul>
                                 </li>
-                                <li><strong>Observation Weight (Step 4)</strong>: The per-point weight $w_i$ in the weighted average $D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$. Higher values make each new observation update the field more aggressively.</li>
-                                <li><strong>Max TSDF Weight (Step 4)</strong>: Cap on the cumulative weight $W_i$. Without this cap, early observations would permanently dominate the average and the field would become insensitive to later corrections. A lower cap keeps the field responsive to new data.</li>
+                                <li><strong>Observation Weight (Step 4)</strong>: The per-point weight $w_i$ in the weighted average
+                                    $$D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$$
+                                    Higher values make each new observation dominate the running average more. In this demo every gaussian point is fused exactly once, so changing this parameter uniformly scales all contributions — the relative effect on the final SDF is minimal. In a real incremental system (e.g. KinectFusion), a higher weight would let new depth frames correct the field faster, but would also amplify the influence of outlier points.
+                                </li>
+                                <li><strong>Max TSDF Weight (Step 4)</strong>: Cap on the cumulative weight $W_i$, i.e. <code>W_i = min(W_{i-1} + w_i, maxWeight)</code>. This prevents early observations from permanently dominating the average as more frames arrive.
+                                    <ul>
+                                        <li><strong>Lower cap</strong>: the field stays responsive to new data — useful in dynamic scenes where surfaces move.</li>
+                                        <li><strong>Higher cap</strong>: the field converges more confidently as observations accumulate, but reacts slowly to corrections.</li>
+                                        <li><em>Note:</em> In this demo the point cloud is fused in a single pass, so each voxel is only observed once. The weight cap is never reached and this parameter has no visible effect. It becomes meaningful when the same scene is scanned multiple times (incremental fusion).</li>
+                                    </ul>
+                                </li>
                             </ul>
                         </div>
 
@@ -220,8 +229,17 @@
                                         <li>μ 越小 → 表面越銳利，但若點雲覆蓋率不足，可能出現破洞。</li>
                                     </ul>
                                 </li>
-                                <li><strong>Observation Weight（Step 4）</strong>：加權平均公式 $D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$ 中每個點的單次觀測權重 $w_i$。數值越高，每次新觀測對數值場的更新幅度越大。</li>
-                                <li><strong>Max TSDF Weight（Step 4）</strong>：累積權重 $W_i$ 的上限。若沒有上限，早期觀測會永遠主導平均值，讓數值場對後續觀測失去敏感度。較低的上限讓數值場持續對新資料保持響應能力。</li>
+                                <li><strong>Observation Weight（Step 4）</strong>：加權平均公式
+                                    $$D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$$
+                                    中每個點的單次觀測權重 $w_i$。數值越高，新觀測對目前均值的主導力越強。在本 demo 中每個 gaussian 點只融合一次，調整此參數等比縮放所有點的貢獻，對最終 SDF 的相對影響有限。在真實的增量式系統（如 KinectFusion）中，較高的權重讓新深度幀能更快修正數值場，但也會放大離群點的影響。
+                                </li>
+                                <li><strong>Max TSDF Weight（Step 4）</strong>：累積權重 $W_i$ 的上限，即 <code>W_i = min(W_{i-1} + w_i, maxWeight)</code>，防止早期觀測隨著幀數增加而永遠主導均值。
+                                    <ul>
+                                        <li><strong>上限較低</strong>：數值場持續對新資料保持響應——適合動態場景或表面有移動的情況。</li>
+                                        <li><strong>上限較高</strong>：觀測累積後收斂更穩定，但對後續修正的反應較慢。</li>
+                                        <li><em>注意：</em>本 demo 的點雲是單次全量融合，每個體素最多只被觀測一次，權重上限永遠不會被觸及，因此此參數在 demo 中沒有可見效果。在同一場景被重複掃描（增量式融合）時才會發揮作用。</li>
+                                    </ul>
+                                </li>
                             </ul>
                         </div>
                     </section>
