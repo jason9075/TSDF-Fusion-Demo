@@ -611,28 +611,9 @@ function setupGUI() {
         camera.position.copy(controls.target).add(offset);
         controls.update();
     });
-
-    const settings = gui.addFolder('Settings');
-    settings.add(params, 'type', ['sphere', 'torus']).name('Surface Type').onChange(v => {
-        scene.remove(gaussianCloud);
-        gaussianCloud = createGaussianCloud(v);
-        scene.add(gaussianCloud);
-        resetDemo();
-    });
-    settings.add(params, 'gaussianCount', 100, 1000, 50).name('Gaussian Count').onChange(() => {
-        scene.remove(gaussianCloud);
-        gaussianCloud = createGaussianCloud(params.type);
-        gaussianCloud.visible = params.showGaussians;
-        scene.add(gaussianCloud);
-    });
-    settings.add(params, 'gsplatNoise', 0.0, 1.0, 0.05).name('Splat Noise').onChange(() => {
-        scene.remove(gaussianCloud);
-        gaussianCloud = createGaussianCloud(params.type);
-        gaussianCloud.visible = params.showGaussians;
-        scene.add(gaussianCloud);
-        resetDemo();
-    });
-    settings.add(params, 'resolution', 32, 96, 16).name('Resolution').onChange(() => {
+    // Shared voxel grid resolution — must be identical for TSDF volume and MarchingCubes
+    // because MC reads the TSDF distances array directly (marchingCubes.field.set(distances)).
+    gui.add(params, 'resolution', 32, 96, 16).name('Grid Resolution (Steps 3–5)').onChange(() => {
         marchingCubes.reset();
         const nextScale = marchingCubes.scale.clone();
         scene.remove(marchingCubes);
@@ -651,12 +632,33 @@ function setupGUI() {
         marchingWireframe.scale.copy(nextScale);
         marchingWireframe.visible = params.showMesh;
         scene.add(marchingWireframe);
-
-        resetDemo();
     });
-    settings.add(params, 'mu', 0.05, 0.4).name('Truncation (μ)');
-    settings.add(params, 'observationWeight', 0.1, 4.0, 0.1).name('Observation Weight');
-    settings.add(params, 'maxTSDFWeight', 1, 128, 1).name('Max TSDF Weight');
+
+    // --- Gaussian Splat (affects Step 1) ---
+    const gsplatFolder = gui.addFolder('Gaussian Splat');
+    gsplatFolder.add(params, 'type', ['sphere', 'torus']).name('Surface Type (Step 1)').onChange(v => {
+        scene.remove(gaussianCloud);
+        gaussianCloud = createGaussianCloud(v);
+        scene.add(gaussianCloud);
+    });
+    gsplatFolder.add(params, 'gaussianCount', 100, 1000, 50).name('Gaussian Count (Step 1)').onChange(() => {
+        scene.remove(gaussianCloud);
+        gaussianCloud = createGaussianCloud(params.type);
+        gaussianCloud.visible = params.showGaussians;
+        scene.add(gaussianCloud);
+    });
+    gsplatFolder.add(params, 'gsplatNoise', 0.0, 1.0, 0.05).name('Splat Noise (Step 1)').onChange(() => {
+        scene.remove(gaussianCloud);
+        gaussianCloud = createGaussianCloud(params.type);
+        gaussianCloud.visible = params.showGaussians;
+        scene.add(gaussianCloud);
+    });
+
+    // --- TSDF Volume (Step 4 params; mu also governs Step 3 active region) ---
+    const tsdfFolder = gui.addFolder('TSDF Volume');
+    tsdfFolder.add(params, 'mu', 0.05, 0.4).name('Truncation μ (Steps 3–4)');
+    tsdfFolder.add(params, 'observationWeight', 0.1, 4.0, 0.1).name('Observation Weight (Step 4)');
+    tsdfFolder.add(params, 'maxTSDFWeight', 1, 128, 1).name('Max TSDF Weight (Step 4)');
 
     const steps = gui.addFolder('Steps');
     const stepCtrls = [
@@ -849,7 +851,10 @@ function triggerStep(step) {
         setVis(ctrlPoints, true);
         setVis(ctrlVoxels, true);
         setVis(ctrlMesh, false);
-        worker.postMessage({ type: 'step3_voxelize' });
+        worker.postMessage({
+            type: 'step3_voxelize',
+            data: { resolution: params.resolution, mu: params.mu },
+        });
 
     } else if (step === 4) {
         if (currentStep < 3) return updateStatus('Error: Complete Step 3 first.');

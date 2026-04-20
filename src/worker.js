@@ -36,6 +36,20 @@ self.onmessage = (e) => {
 
         case 'step3_voxelize':
             if (volume && currentPoints) {
+                if (data) {
+                    // Rebuild volume if resolution changed so voxelSize/range are correct.
+                    if (data.resolution !== undefined && data.resolution !== volume.size) {
+                        volume = new TSDFVolume({
+                            size: data.resolution,
+                            extent: volume.extent,
+                            mu: data.mu ?? volume.mu,
+                            maxTSDFWeight: volume.maxTSDFWeight,
+                        });
+                    } else if (data.mu !== undefined) {
+                        volume.mu = data.mu;
+                        volume.range = Math.ceil(data.mu / volume.voxelSize);
+                    }
+                }
                 self.postMessage({ type: 'voxels', data: getAffectedVoxels(volume, currentPoints) });
             }
             break;
