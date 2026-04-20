@@ -21,6 +21,7 @@ const params = {
     showVoxels: true,
     showMesh: true,
     showCamera: false,
+    showGrids: true,
     showKnowledge: () => toggleModal(true),
     cameraZoom: 5.2, // initial distance = length of (3,3,3)
     type: 'sphere',
@@ -37,6 +38,7 @@ const params = {
 let scene, camera, renderer, controls;
 let marchingCubes, marchingWireframe, pointCloud, voxelCloud;
 let gaussianCloud = null;
+let gridHelper = null;
 let cameraHelpers = [];
 let scanLines = []; // animated rays during step 1
 let worker;
@@ -364,8 +366,9 @@ function init() {
     dirLight.position.set(1, 1, 1);
     scene.add(dirLight);
 
-    // Helpers
-    const gridHelper = new THREE.GridHelper(4, 20, 0x4c566a, 0x3b4252);
+    // Helpers — grid divisions match the voxel resolution so each cell = one voxel column
+    gridHelper = new THREE.GridHelper(4, params.resolution, 0x4c566a, 0x3b4252);
+    gridHelper.visible = params.showGrids;
     scene.add(gridHelper);
 
     // Gaussian cloud — represents the 3DGS scene the virtual cameras will scan
@@ -619,9 +622,15 @@ function setupGUI() {
     // Shared voxel grid resolution — must be identical for TSDF volume and MarchingCubes
     // because MC reads the TSDF distances array directly (marchingCubes.field.set(distances)).
     params.voxelSizeDisplay = `${(4.0 / params.resolution).toFixed(4)}`;
-    gui.add(params, 'resolution', 32, 96, 16).name('Grid Resolution (Steps 3–5)').onChange(() => {
+    gui.add(params, 'resolution', 32, 96, 16).name('Grid Resolution').onChange(() => {
         params.voxelSizeDisplay = `${(4.0 / params.resolution).toFixed(4)}`;
         voxelSizeCtrl.updateDisplay();
+
+        // Rebuild grid so divisions = resolution (each cell = one voxel column)
+        scene.remove(gridHelper);
+        gridHelper = new THREE.GridHelper(4, params.resolution, 0x4c566a, 0x3b4252);
+        gridHelper.visible = params.showGrids;
+        scene.add(gridHelper);
 
         marchingCubes.reset();
         const nextScale = marchingCubes.scale.clone();
@@ -645,19 +654,19 @@ function setupGUI() {
     const voxelSizeCtrl = gui.add(params, 'voxelSizeDisplay').name('↳ Voxel Size').disable();
 
     // --- Gaussian Splat (affects Step 1) ---
-    const gsplatFolder = gui.addFolder('Gaussian Splat');
-    gsplatFolder.add(params, 'type', ['sphere', 'torus']).name('Surface Type (Step 1)').onChange(v => {
+    const gsplatFolder = gui.addFolder('Gaussian Splat (Step 1)');
+    gsplatFolder.add(params, 'type', ['sphere', 'torus']).name('Surface Type').onChange(v => {
         scene.remove(gaussianCloud);
         gaussianCloud = createGaussianCloud(v);
         scene.add(gaussianCloud);
     });
-    gsplatFolder.add(params, 'gaussianCount', 100, 1000, 50).name('Gaussian Count (Step 1)').onChange(() => {
+    gsplatFolder.add(params, 'gaussianCount', 100, 1000, 50).name('Gaussian Count').onChange(() => {
         scene.remove(gaussianCloud);
         gaussianCloud = createGaussianCloud(params.type);
         gaussianCloud.visible = params.showGaussians;
         scene.add(gaussianCloud);
     });
-    gsplatFolder.add(params, 'gsplatNoise', 0.0, 1.0, 0.05).name('Splat Noise (Step 1)').onChange(() => {
+    gsplatFolder.add(params, 'gsplatNoise', 0.0, 1.0, 0.05).name('Splat Noise').onChange(() => {
         scene.remove(gaussianCloud);
         gaussianCloud = createGaussianCloud(params.type);
         gaussianCloud.visible = params.showGaussians;
@@ -665,10 +674,10 @@ function setupGUI() {
     });
 
     // --- TSDF Volume (Step 4 params; mu also governs Step 3 active region) ---
-    const tsdfFolder = gui.addFolder('TSDF Volume');
-    tsdfFolder.add(params, 'muVoxels', 1, 10, 0.5).name('Truncation μ (voxels, Steps 3–4)');
-    tsdfFolder.add(params, 'observationWeight', 0.1, 4.0, 0.1).name('Observation Weight (Step 4)');
-    tsdfFolder.add(params, 'maxTSDFWeight', 1, 128, 1).name('Max TSDF Weight (Step 4)');
+    const tsdfFolder = gui.addFolder('TSDF Volume (Steps 3–4)');
+    tsdfFolder.add(params, 'muVoxels', 1, 10, 0.5).name('Truncation μ');
+    tsdfFolder.add(params, 'observationWeight', 0.1, 4.0, 0.1).name('Observation Weight');
+    tsdfFolder.add(params, 'maxTSDFWeight', 1, 128, 1).name('Max TSDF Weight');
 
     const steps = gui.addFolder('Steps');
     const stepCtrls = [
@@ -676,12 +685,14 @@ function setupGUI() {
         steps.add(params, 'step2').name('2. Reconstruct Point Cloud'),
         steps.add(params, 'step3').name('3. Mark Active Voxels'),
         steps.add(params, 'step4').name('4. Integrate TSDF'),
-        steps.add(params, 'step5').name('5. Extract Mesh'),
+        steps.add(params, 'step5').name('5. Extract Mesh (Marching Cubes)'),
     ];
     steps.add(params, 'reset').name('Reset Everything');
     window._stepCtrls = stepCtrls;
 
     const view = gui.addFolder('Visibility');
+    view.add(params, 'showGrids').name('Show Grids')
+        .onChange(v => { gridHelper.visible = v; });
     const ctrlGaussians = view.add(params, 'showGaussians').name('Show Gaussians')
         .onChange(v => { gaussianCloud.visible = v; });
     const ctrlCamera = view.add(params, 'showCamera').name('Show Camera')
