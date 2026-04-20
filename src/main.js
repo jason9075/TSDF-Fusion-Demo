@@ -527,6 +527,68 @@ function stopVoxelIntegration() {
     voxelCloud.material.size = 0.03;
 }
 
+/**
+ * Color each active voxel by its TSDF scalar value using a diverging colormap:
+ *   blue  (t = -1) → white (t = 0, zero-crossing / surface) → red (t = +1)
+ *   near-black = unobserved (d ≈ 1.0)
+ * PointsMaterial has no per-vertex alpha, so brightness encodes importance.
+ */
+function updateVoxelColors(distances) {
+    const posAttr = voxelCloud.geometry.attributes.position;
+    if (!posAttr) return;
+
+    const N = posAttr.count;
+    const extent = 2.0;
+    const size = params.resolution;
+    const voxelSize = (extent * 2) / size;
+    const mu = params.mu;
+    const sizeSq = size * size;
+
+    const colorData = new Float32Array(N * 3);
+
+    for (let i = 0; i < N; i++) {
+        const wx = posAttr.getX(i);
+        const wy = posAttr.getY(i);
+        const wz = posAttr.getZ(i);
+
+        const ix = Math.floor((wx + extent) / voxelSize);
+        const iy = Math.floor((wy + extent) / voxelSize);
+        const iz = Math.floor((wz + extent) / voxelSize);
+        const idx = ix + iy * size + iz * sizeSq;
+        const d = (idx >= 0 && idx < distances.length) ? distances[idx] : 1.0;
+
+        let r, g, b;
+        if (d >= 0.99) {
+            // Unobserved — near-black so it fades into the background
+            r = 0.12; g = 0.13; b = 0.16;
+        } else {
+            const t = Math.max(-1, Math.min(1, d / mu));
+            if (t <= 0) {
+                // Negative SDF (behind surface): white → Nord10 blue #5e81ac
+                const s = -t;
+                r = 1.0 - s * (1.0 - 0.369);
+                g = 1.0 - s * (1.0 - 0.506);
+                b = 1.0 - s * (1.0 - 0.675);
+            } else {
+                // Positive SDF (in front of surface): white → Nord11 red #bf616a
+                r = 1.0 - t * (1.0 - 0.749);
+                g = 1.0 - t * (1.0 - 0.380);
+                b = 1.0 - t * (1.0 - 0.416);
+            }
+        }
+        colorData[i * 3]     = r;
+        colorData[i * 3 + 1] = g;
+        colorData[i * 3 + 2] = b;
+    }
+
+    voxelCloud.geometry.setAttribute('color', new THREE.BufferAttribute(colorData, 3));
+    voxelCloud.material.vertexColors = true;
+    voxelCloud.material.color.set(0xffffff); // must be white so it doesn't tint vertex colors
+    voxelCloud.material.opacity = 0.80;
+    voxelCloud.material.size = 0.042;
+    voxelCloud.material.needsUpdate = true;
+}
+
 function updateVoxelIntegration(progress) {
     voxelIntegrationState.active = progress < 1;
     voxelIntegrationState.progress = progress;
@@ -681,11 +743,13 @@ function initWorker() {
             case 'fusing_progress': {
                 const percent = (data.progress * 100).toFixed(0);
                 distancesBuffer = data.distances;
-                updateVoxelIntegration(data.progress);
-                updateStatus(`Step 4: Integrating TSDF... ${percent}%`);
                 if (data.isDone) {
                     stopVoxelIntegration();
+                    updateVoxelColors(data.distances);
                     updateStatus(`Step 4 Complete: TSDF field integrated in ${data.time.toFixed(2)}ms. Run Step 5 to extract the mesh.`);
+                } else {
+                    updateVoxelIntegration(data.progress);
+                    updateStatus(`Step 4: Integrating TSDF... ${percent}%`);
                 }
                 break;
             }
@@ -798,7 +862,14 @@ function triggerStep(step) {
         setVis(ctrlPoints, false);
         setVis(ctrlVoxels, true);
         setVis(ctrlMesh, false);
-        worker.postMessage({ type: 'step4_fuse' });
+        worker.postMessage({
+            type: 'step4_fuse',
+            data: {
+                mu: params.mu,
+                observationWeight: params.observationWeight,
+                maxTSDFWeight: params.maxTSDFWeight,
+            },
+        });
 
     } else if (step === 5) {
         if (currentStep < 4) return updateStatus('Error: Complete Step 4 first.');
@@ -828,6 +899,9 @@ function renderPoints(data) {
 }
 
 function renderVoxels(data) {
+    voxelCloud.geometry.deleteAttribute('color');
+    voxelCloud.material.vertexColors = false;
+    voxelCloud.material.needsUpdate = true;
     voxelCloud.geometry.setAttribute('position', new THREE.BufferAttribute(data, 3));
     voxelCloud.geometry.setDrawRange(0, 0);
     voxelCloud.material.opacity = 0.08;

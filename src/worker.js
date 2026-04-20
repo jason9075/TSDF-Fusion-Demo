@@ -42,6 +42,20 @@ self.onmessage = (e) => {
 
         case 'step4_fuse':
             if (volume && currentPoints) {
+                // Apply latest params so re-running step 4 after changing mu/weights
+                // always reflects the current GUI settings.
+                if (data) {
+                    if (data.mu !== undefined) {
+                        volume.mu = data.mu;
+                        volume.range = Math.ceil(data.mu / volume.voxelSize);
+                    }
+                    if (data.observationWeight !== undefined) observationWeight = data.observationWeight;
+                    if (data.maxTSDFWeight    !== undefined) volume.maxTSDFWeight = data.maxTSDFWeight;
+                }
+                // Reset the volume so each run starts fresh — otherwise repeated
+                // runs accumulate weights and changing params has no visible effect.
+                volume.distances.fill(1.0);
+                volume.weights.fill(0.0);
                 fuseProgressive(volume, currentPoints);
             }
             break;
