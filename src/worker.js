@@ -134,51 +134,23 @@ async function renderDepthMapsProgressive() {
 }
 
 /**
- * Sample a dense point cloud from the gaussian positions sent by the main thread.
- * Floaters, needles, and blobs in the gsplat are naturally included because their
- * positions (with artifact offsets already applied) are stored in gaussianPoints.
- * Each gaussian center is oversampled with small noise to reach density comparable
- * to the raycast-based approach.
+ * Build a point cloud directly from gaussian positions (1:1, no noise added).
+ * Artifact positions (floaters, needles, blobs) are already baked into gaussianPoints
+ * by createGaussianCloud() in main.js, so the distribution mirrors the visual splat.
  */
 function samplePointCloudFromGaussians() {
     const N = gaussianPoints.length / 6; // [x,y,z,nx,ny,nz] per entry
-    // Target density ≈ what 8 cameras × 48×48 pixels × ~65% hit rate gives
-    const targetTotal = Math.round(CAM_COUNT * DEPTH_RES * DEPTH_RES * 0.65);
-    const oversample  = Math.max(1, Math.round(targetTotal / N));
-    const points = [];
-
+    const points = new Float32Array(N * 7);
     for (let i = 0; i < N; i++) {
-        const gx = gaussianPoints[i * 6];
-        const gy = gaussianPoints[i * 6 + 1];
-        const gz = gaussianPoints[i * 6 + 2];
-        const nx = gaussianPoints[i * 6 + 3];
-        const ny = gaussianPoints[i * 6 + 4];
-        const nz = gaussianPoints[i * 6 + 5];
-
-        for (let j = 0; j < oversample; j++) {
-            points.push(
-                gx + gaussianRandom() * noiseStd,
-                gy + gaussianRandom() * noiseStd,
-                gz + gaussianRandom() * noiseStd,
-                nx, ny, nz, observationWeight,
-            );
-        }
+        points[i * 7]     = gaussianPoints[i * 6];
+        points[i * 7 + 1] = gaussianPoints[i * 6 + 1];
+        points[i * 7 + 2] = gaussianPoints[i * 6 + 2];
+        points[i * 7 + 3] = gaussianPoints[i * 6 + 3];
+        points[i * 7 + 4] = gaussianPoints[i * 6 + 4];
+        points[i * 7 + 5] = gaussianPoints[i * 6 + 5];
+        points[i * 7 + 6] = observationWeight;
     }
-
-    // Gsplat floaters are already in the data as displaced positions.
-    // Add a small fraction of extra random outliers on top (simulates
-    // back-projection failures from low-opacity regions).
-    const extraOutliers = Math.floor(points.length / 7 * outlierRate * 0.3);
-    for (let i = 0; i < extraOutliers; i++) {
-        const ox = (Math.random() - 0.5) * 4;
-        const oy = (Math.random() - 0.5) * 4;
-        const oz = (Math.random() - 0.5) * 4;
-        let onx = Math.random() - 0.5, ony = Math.random() - 0.5, onz = Math.random() - 0.5;
-        const onLen = Math.sqrt(onx ** 2 + ony ** 2 + onz ** 2);
-        points.push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, observationWeight);
-    }
-
-    return new Float32Array(points);
+    return points;
 }
 
 /**

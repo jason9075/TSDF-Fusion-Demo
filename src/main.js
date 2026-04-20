@@ -15,11 +15,12 @@ const params = {
     noise: 0.05,
     outliers: 0.02,
     gaussianCount: 500,
+    gsplatNoise: 0.5,
     showGaussians: true,
     showPoints: true,
     showVoxels: true,
     showMesh: true,
-    showCamera: true,
+    showCamera: false,
     showKnowledge: () => toggleModal(true),
     cameraZoom: 5.2, // initial distance = length of (3,3,3)
     type: 'sphere',
@@ -73,7 +74,7 @@ const DEPTH_RES = 48; // must match worker.js
  * in the surface-normal direction, wide tangentially) — the hallmark look of GSplat.
  * @param {'sphere'|'torus'} type
  */
-function createGaussianCloud(type, N = params.gaussianCount) {
+function createGaussianCloud(type, N = params.gaussianCount, noise = params.gsplatNoise) {
     const geo = new THREE.SphereGeometry(1, 5, 4);
     const mat = new THREE.MeshBasicMaterial({
         transparent: true,
@@ -115,55 +116,53 @@ function createGaussianCloud(type, N = params.gaussianCount) {
 
         const baseHue = (Math.atan2(nz, nx) / (Math.PI * 2) + 0.5 + ny * 0.15) % 1.0;
 
-        // --- Artifact type (probabilities tuned to look like real 3DGS) ---
+        // --- Artifact type — probabilities and jitter scale with gsplatNoise (0..1) ---
+        // At noise=0: all gaussians are clean surface splats with no position offset.
+        // At noise=1: full artifact mix (floaters 8%, needles 10%, blobs 7%).
         const roll = Math.random();
         let sx, sy, sz, hue, sat, lig;
 
-        if (roll < 0.08) {
+        if (roll < 0.08 * noise) {
             // Floater — drifts off the surface, common near object boundaries
-            const drift = 0.2 + Math.random() * 0.6;
-            x += nx * drift + (Math.random() - 0.5) * 0.25;
-            y += ny * drift + (Math.random() - 0.5) * 0.25;
-            z += nz * drift + (Math.random() - 0.5) * 0.25;
-            // Nearly isotropic (no preferred orientation in open space)
+            const drift = (0.2 + Math.random() * 0.6) * noise;
+            x += nx * drift + (Math.random() - 0.5) * 0.25 * noise;
+            y += ny * drift + (Math.random() - 0.5) * 0.25 * noise;
+            z += nz * drift + (Math.random() - 0.5) * 0.25 * noise;
             sx = sz = 0.025 + Math.random() * 0.05;
             sy = 0.025 + Math.random() * 0.05;
-            hue = Math.random(); // arbitrary color
-            sat = 0.25; lig = 0.20 + Math.random() * 0.12; // dim
+            hue = Math.random();
+            sat = 0.25; lig = 0.20 + Math.random() * 0.12;
 
-        } else if (roll < 0.18) {
+        } else if (roll < (0.08 + 0.10) * noise) {
             // Needle — very elongated in one tangential direction.
-            // Appears on thin structures, occluding edges, or bad-angle views.
-            x += (Math.random() - 0.5) * 0.04;
-            y += (Math.random() - 0.5) * 0.04;
-            z += (Math.random() - 0.5) * 0.04;
-            sx = 0.18 + Math.random() * 0.18; // long tangential axis
-            sy = 0.006 + Math.random() * 0.006; // thin normal axis
-            sz = 0.008 + Math.random() * 0.01;  // thin other tangential
+            x += (Math.random() - 0.5) * 0.04 * noise;
+            y += (Math.random() - 0.5) * 0.04 * noise;
+            z += (Math.random() - 0.5) * 0.04 * noise;
+            sx = 0.18 + Math.random() * 0.18;
+            sy = 0.006 + Math.random() * 0.006;
+            sz = 0.008 + Math.random() * 0.01;
             hue = baseHue;
             sat = 0.55; lig = 0.35 + Math.random() * 0.2;
 
-        } else if (roll < 0.25) {
+        } else if (roll < (0.08 + 0.10 + 0.07) * noise) {
             // Oversized blob — large Gaussian covering a uniform region.
-            // Common on flat surfaces or sky backgrounds.
-            x += (Math.random() - 0.5) * 0.05;
-            y += (Math.random() - 0.5) * 0.05;
-            z += (Math.random() - 0.5) * 0.05;
+            x += (Math.random() - 0.5) * 0.05 * noise;
+            y += (Math.random() - 0.5) * 0.05 * noise;
+            z += (Math.random() - 0.5) * 0.05 * noise;
             sx = 0.14 + Math.random() * 0.14;
             sy = 0.05 + Math.random() * 0.05;
             sz = 0.14 + Math.random() * 0.14;
             hue = (baseHue + 0.04) % 1.0;
-            sat = 0.35; lig = 0.25 + Math.random() * 0.12; // dim large blob
+            sat = 0.35; lig = 0.25 + Math.random() * 0.12;
 
         } else {
             // Normal surface Gaussian — flat, asymmetric tangential ellipsoid.
-            // sx ≠ sz to capture the real anisotropy seen in 3DGS.
-            x += (Math.random() - 0.5) * 0.06;
-            y += (Math.random() - 0.5) * 0.06;
-            z += (Math.random() - 0.5) * 0.06;
+            x += (Math.random() - 0.5) * 0.06 * noise;
+            y += (Math.random() - 0.5) * 0.06 * noise;
+            z += (Math.random() - 0.5) * 0.06 * noise;
             sx = 0.05 + Math.random() * 0.10;
             sy = 0.012 + Math.random() * 0.022;
-            sz = 0.03  + Math.random() * 0.08; // different from sx
+            sz = 0.03  + Math.random() * 0.08;
             hue = baseHue;
             sat = 0.65 + Math.random() * 0.25;
             lig = 0.55 + Math.random() * 0.20;
@@ -564,6 +563,13 @@ function setupGUI() {
         gaussianCloud.visible = params.showGaussians;
         scene.add(gaussianCloud);
     });
+    settings.add(params, 'gsplatNoise', 0.0, 1.0, 0.05).name('Splat Noise').onChange(() => {
+        scene.remove(gaussianCloud);
+        gaussianCloud = createGaussianCloud(params.type);
+        gaussianCloud.visible = params.showGaussians;
+        scene.add(gaussianCloud);
+        resetDemo();
+    });
     settings.add(params, 'resolution', 32, 96, 16).name('Resolution').onChange(() => {
         marchingCubes.reset();
         const nextScale = marchingCubes.scale.clone();
@@ -710,7 +716,7 @@ function initWorker() {
                 scene.add(gaussianCloud);
                 const rc = window._visCtrl;
                 setVis(rc.ctrlGaussians, true);
-                setVis(rc.ctrlCamera, true);
+                setVis(rc.ctrlCamera, false);
                 setVis(rc.ctrlPoints, false);
                 setVis(rc.ctrlVoxels, false);
                 setVis(rc.ctrlMesh, false);
