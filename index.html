@@ -146,6 +146,85 @@
                         <p class="lang-en">Real sensors and learned renderers are imperfect: depths jitter, normals are approximate, and some samples are simply wrong. TSDF fusion is useful because it converts many noisy local observations into a smoother global field. If enough observations agree, the zero crossing stays stable even when individual samples are messy.</p>
                         <p class="lang-zh hidden">真實感測器與學習式渲染器都不完美：深度會抖動、法向量只是近似、有些樣本甚至完全錯誤。TSDF 融合的價值就在於，它能把大量局部且帶噪的觀測整合成更平滑的全域數值場。只要足夠多的觀測彼此一致，零交叉面就能保持穩定，不會被單一錯誤樣本主導。</p>
                     </section>
+
+                    <section>
+                        <h3 class="lang-en">7. GUI Parameters Reference</h3>
+                        <h3 class="lang-zh hidden">7. GUI 參數說明</h3>
+
+                        <div class="lang-en">
+                            <h4>Grid Resolution <small>(Steps 3–5)</small></h4>
+                            <p>The <em>N</em> in the shared N×N×N voxel grid used by voxelization, TSDF fusion, and Marching Cubes. All three steps must use the same grid, so this is a top-level setting.</p>
+                            <p>Since the world space spans $[-2, 2]^3$ (extent = 2.0), voxel size is: $$\text{voxelSize} = \frac{2 \times \text{extent}}{N} = \frac{4}{N}$$The GUI shows the current voxel size as a read-only field (↳ Voxel Size) directly below the slider.</p>
+                            <ul>
+                                <li><strong>Higher N</strong>: finer surface detail, but memory and compute scale as N³. At N=64, voxelSize = 4/64 = 0.0625; at N=32, voxelSize = 0.125.</li>
+                                <li><strong>Lower N</strong>: faster, but the extracted mesh looks blocky because a sphere of radius 1 only spans $2/\text{voxelSize}$ voxels across its diameter.</li>
+                            </ul>
+
+                            <h4>Gaussian Splat <small>(Step 1)</small></h4>
+                            <ul>
+                                <li><strong>Surface Type</strong>: The underlying geometry (sphere or torus) that gaussian centers are sampled from. Changing this regenerates the whole splat scene.</li>
+                                <li><strong>Gaussian Count</strong>: Number of gaussian instances. More gaussians = denser point cloud in Step 2, better TSDF coverage in Step 4.</li>
+                                <li><strong>Splat Noise</strong>: Controls the probability and magnitude of 3DGS-style artifacts.
+                                    <ul>
+                                        <li><strong>0.0</strong>: All gaussians sit exactly on the ideal surface with no jitter — a perfect clean scene.</li>
+                                        <li><strong>1.0</strong>: Full artifact mix: floaters (8%, drift off-surface), needles (10%, elongated at edges), oversized blobs (7%), plus position jitter on normal gaussians.</li>
+                                        <li>The generated positions are passed directly to the worker as the Step 2 point cloud, so the splat distribution is faithfully reflected in reconstruction.</li>
+                                    </ul>
+                                </li>
+                            </ul>
+
+                            <h4>TSDF Volume</h4>
+                            <ul>
+                                <li><strong>Truncation μ in voxels (Steps 3–4)</strong>: The half-width of the truncation band, expressed as a <em>number of voxels</em>. The actual world-space distance is $\mu = \mu_\text{voxels} \times \text{voxelSize}$, so it automatically scales with resolution.
+                                    <ul>
+                                        <li>In Step 3, sets the active voxel neighborhood radius: <code>range = μ<sub>voxels</sub></code> voxels on each side of a surface point.</li>
+                                        <li>In Step 4, only voxels where $|\text{SDF}| \leq \mu$ are updated.</li>
+                                        <li>Larger μ → wider band, smoother field, but blurrier surfaces and more outlier influence. KinectFusion recommends 3–5 voxels.</li>
+                                        <li>Smaller μ → sharper surfaces, but gaps may appear where surface coverage is thin.</li>
+                                    </ul>
+                                </li>
+                                <li><strong>Observation Weight (Step 4)</strong>: The per-point weight $w_i$ in the weighted average $D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$. Higher values make each new observation update the field more aggressively.</li>
+                                <li><strong>Max TSDF Weight (Step 4)</strong>: Cap on the cumulative weight $W_i$. Without this cap, early observations would permanently dominate the average and the field would become insensitive to later corrections. A lower cap keeps the field responsive to new data.</li>
+                            </ul>
+                        </div>
+
+                        <div class="lang-zh hidden">
+                            <h4>Grid Resolution <small>（Steps 3–5）</small></h4>
+                            <p>三個步驟共用的 N×N×N 體素格子的邊長 N。體素化、TSDF 融合、Marching Cubes 三者必須使用同一個格子，因此這是頂層共享參數。</p>
+                            <p>場景世界空間範圍為 $[-2, 2]^3$（extent = 2.0），因此 voxel 大小為：$$\text{voxelSize} = \frac{2 \times \text{extent}}{N} = \frac{4}{N}$$控制面板在 Resolution 滑桿正下方有 ↳ Voxel Size 唯讀欄位，即時顯示目前的格子大小。</p>
+                            <ul>
+                                <li><strong>N 越大</strong>：表面細節越精細，但記憶體與計算量以 N³ 成長。N=64 時 voxelSize = 0.0625；N=32 時 voxelSize = 0.125。</li>
+                                <li><strong>N 越小</strong>：速度快，但提取出的網格會呈現方塊感，因為半徑 1 的球只橫跨 $2/\text{voxelSize}$ 個格子。</li>
+                            </ul>
+
+                            <h4>Gaussian Splat <small>（Step 1）</small></h4>
+                            <ul>
+                                <li><strong>Surface Type</strong>：Gaussian 中心點採樣的基底幾何（球體或環面）。更換後會重新生成整個 splat 場景。</li>
+                                <li><strong>Gaussian Count</strong>：Gaussian 實例數量。越多代表 Step 2 的點雲越密集，Step 4 的 TSDF 覆蓋率也越好。</li>
+                                <li><strong>Splat Noise</strong>：控制 3DGS 風格 artifact 的出現機率與偏移幅度。
+                                    <ul>
+                                        <li><strong>0.0</strong>：所有 gaussian 精確落在理想表面上，無任何偏移，代表完美的重建場景。</li>
+                                        <li><strong>1.0</strong>：完整 artifact 配置：floater（8%，漂浮在表面外）、needle（10%，邊緣處的細長型）、oversized blob（7%，覆蓋均勻區域的大型 gaussian），加上一般 gaussian 的位置抖動。</li>
+                                        <li>生成的位置會直接傳給 worker 作為 Step 2 的點雲來源，因此 splat 分布會忠實反映到重建結果中。</li>
+                                    </ul>
+                                </li>
+                            </ul>
+
+                            <h4>TSDF Volume</h4>
+                            <ul>
+                                <li><strong>Truncation μ（voxel 數，Steps 3–4）</strong>：截斷帶的半寬度，以<em>格子數</em>為單位。實際世界空間距離為 $\mu = \mu_\text{voxels} \times \text{voxelSize}$，因此會自動隨 resolution 縮放。
+                                    <ul>
+                                        <li>在 Step 3 中，決定 active voxel 的鄰域半徑：每個表面點往外 <code>μ<sub>voxels</sub></code> 個格子。</li>
+                                        <li>在 Step 4 中，只有 $|\text{SDF}| \leq \mu$ 的體素才會被更新。</li>
+                                        <li>μ 越大 → 截斷帶越寬，數值場越平滑，但表面較模糊、離群點影響範圍也更大。KinectFusion 建議使用 3–5 格。</li>
+                                        <li>μ 越小 → 表面越銳利，但若點雲覆蓋率不足，可能出現破洞。</li>
+                                    </ul>
+                                </li>
+                                <li><strong>Observation Weight（Step 4）</strong>：加權平均公式 $D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$ 中每個點的單次觀測權重 $w_i$。數值越高，每次新觀測對數值場的更新幅度越大。</li>
+                                <li><strong>Max TSDF Weight（Step 4）</strong>：累積權重 $W_i$ 的上限。若沒有上限，早期觀測會永遠主導平均值，讓數值場對後續觀測失去敏感度。較低的上限讓數值場持續對新資料保持響應能力。</li>
+                            </ul>
+                        </div>
+                    </section>
                 </div>
             </div>
         </div>

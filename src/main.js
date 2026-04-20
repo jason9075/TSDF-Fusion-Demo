@@ -9,7 +9,7 @@ import GUI from 'lil-gui';
 
 const params = {
     resolution: 64,
-    mu: 0.15,
+    muVoxels: 4,
     observationWeight: 1.0,
     maxTSDFWeight: 32,
     noise: 0.05,
@@ -492,6 +492,11 @@ function renderMath() {
     // Our HTML has IDs formula-d and formula-w with math content inside or we can just put math in them
 }
 
+/** Actual truncation distance in world units: muVoxels × voxelSize. */
+function getMu() {
+    return params.muVoxels * (4.0 / params.resolution);
+}
+
 function easeOutCubic(t) {
     return 1 - (1 - t) ** 3;
 }
@@ -541,7 +546,7 @@ function updateVoxelColors(distances) {
     const extent = 2.0;
     const size = params.resolution;
     const voxelSize = (extent * 2) / size;
-    const mu = params.mu;
+    const mu = getMu();
     const sizeSq = size * size;
 
     const colorData = new Float32Array(N * 3);
@@ -613,7 +618,11 @@ function setupGUI() {
     });
     // Shared voxel grid resolution — must be identical for TSDF volume and MarchingCubes
     // because MC reads the TSDF distances array directly (marchingCubes.field.set(distances)).
+    params.voxelSizeDisplay = `${(4.0 / params.resolution).toFixed(4)}`;
     gui.add(params, 'resolution', 32, 96, 16).name('Grid Resolution (Steps 3–5)').onChange(() => {
+        params.voxelSizeDisplay = `${(4.0 / params.resolution).toFixed(4)}`;
+        voxelSizeCtrl.updateDisplay();
+
         marchingCubes.reset();
         const nextScale = marchingCubes.scale.clone();
         scene.remove(marchingCubes);
@@ -633,6 +642,7 @@ function setupGUI() {
         marchingWireframe.visible = params.showMesh;
         scene.add(marchingWireframe);
     });
+    const voxelSizeCtrl = gui.add(params, 'voxelSizeDisplay').name('↳ Voxel Size').disable();
 
     // --- Gaussian Splat (affects Step 1) ---
     const gsplatFolder = gui.addFolder('Gaussian Splat');
@@ -656,7 +666,7 @@ function setupGUI() {
 
     // --- TSDF Volume (Step 4 params; mu also governs Step 3 active region) ---
     const tsdfFolder = gui.addFolder('TSDF Volume');
-    tsdfFolder.add(params, 'mu', 0.05, 0.4).name('Truncation μ (Steps 3–4)');
+    tsdfFolder.add(params, 'muVoxels', 1, 10, 0.5).name('Truncation μ (voxels, Steps 3–4)');
     tsdfFolder.add(params, 'observationWeight', 0.1, 4.0, 0.1).name('Observation Weight (Step 4)');
     tsdfFolder.add(params, 'maxTSDFWeight', 1, 128, 1).name('Max TSDF Weight (Step 4)');
 
@@ -853,7 +863,7 @@ function triggerStep(step) {
         setVis(ctrlMesh, false);
         worker.postMessage({
             type: 'step3_voxelize',
-            data: { resolution: params.resolution, mu: params.mu },
+            data: { resolution: params.resolution, mu: getMu() },
         });
 
     } else if (step === 4) {
@@ -870,7 +880,7 @@ function triggerStep(step) {
         worker.postMessage({
             type: 'step4_fuse',
             data: {
-                mu: params.mu,
+                mu: getMu(),
                 observationWeight: params.observationWeight,
                 maxTSDFWeight: params.maxTSDFWeight,
             },
@@ -937,7 +947,7 @@ function sendInitToWorker() {
         data: {
             size: params.resolution,
             extent: 2.0,
-            mu: params.mu,
+            mu: getMu(),
             observationWeight: params.observationWeight,
             maxTSDFWeight: params.maxTSDFWeight,
             type: params.type,
