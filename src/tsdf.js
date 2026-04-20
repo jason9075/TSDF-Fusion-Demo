@@ -8,11 +8,13 @@ export class TSDFVolume {
      * @param {number} options.size - Grid resolution (N x N x N)
      * @param {number} options.extent - World coordinate range (e.g. 2.0 means [-2, 2])
      * @param {number} options.mu - Truncation distance
+     * @param {number} options.maxTSDFWeight - Clamp for cumulative fusion weight
      */
     constructor(options = {}) {
-        this.size = options.size || 64;
-        this.extent = options.extent || 2.0;
-        this.mu = options.mu || 0.1;
+        this.size = options.size ?? 64;
+        this.extent = options.extent ?? 2.0;
+        this.mu = options.mu ?? 0.1;
+        this.maxTSDFWeight = options.maxTSDFWeight ?? 32;
         
         this.numVoxels = this.size * this.size * this.size;
         this.distances = new Float32Array(this.numVoxels).fill(1.0); // 1.0 is "far" (max distance)
@@ -80,9 +82,10 @@ export class TSDFVolume {
                             const currentD = this.distances[idx];
                             const currentW = this.weights[idx];
                             
-                            const newW = currentW + pw;
-                            this.distances[idx] = (currentW * currentD + pw * sdf) / newW;
-                            this.weights[idx] = newW;
+                            const unclampedW = currentW + pw;
+                            const nextDistance = (currentW * currentD + pw * sdf) / unclampedW;
+                            this.distances[idx] = nextDistance;
+                            this.weights[idx] = Math.min(this.maxTSDFWeight, unclampedW);
                         }
                     }
                 }

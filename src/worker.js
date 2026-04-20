@@ -5,6 +5,7 @@ let currentPoints = null;
 let sceneType = 'sphere';
 let noiseStd = 0.02;
 let outlierRate = 0.05;
+let observationWeight = 1.0;
 
 /** Must match the constants in main.js */
 const CAM_COUNT = 8;
@@ -22,6 +23,7 @@ self.onmessage = (e) => {
             sceneType = data.type || 'sphere';
             noiseStd = data.noise || 0.02;
             outlierRate = data.outliers || 0.05;
+            observationWeight = data.observationWeight ?? 1.0;
             currentPoints = null;
             self.postMessage({ type: 'ready' });
             break;
@@ -150,7 +152,7 @@ async function renderDepthMapsProgressive() {
                     hx + gaussianRandom() * noiseStd,
                     hy + gaussianRandom() * noiseStd,
                     hz + gaussianRandom() * noiseStd,
-                    nx, ny, nz, 1.0,
+                    nx, ny, nz, observationWeight,
                 );
             }
         }
@@ -169,7 +171,7 @@ async function renderDepthMapsProgressive() {
         let ony = Math.random() - 0.5;
         let onz = Math.random() - 0.5;
         const onLen = Math.sqrt(onx ** 2 + ony ** 2 + onz ** 2);
-        allPoints.push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, 1.0);
+        allPoints.push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, observationWeight);
     }
 
     currentPoints = new Float32Array(allPoints);

@@ -10,6 +10,8 @@ import GUI from 'lil-gui';
 const params = {
     resolution: 64,
     mu: 0.15,
+    observationWeight: 1.0,
+    maxTSDFWeight: 32,
     noise: 0.05,
     outliers: 0.02,
     gaussianCount: 500,
@@ -17,11 +19,9 @@ const params = {
     showPoints: true,
     showVoxels: true,
     showMesh: true,
-    showSlice: false,
     showCamera: true,
     showKnowledge: () => toggleModal(true),
     cameraZoom: 5.2, // initial distance = length of (3,3,3)
-    slicePos: 0.0,
     type: 'sphere',
 
     // Step Buttons
@@ -34,7 +34,7 @@ const params = {
 };
 
 let scene, camera, renderer, controls;
-let marchingCubes, marchingWireframe, pointCloud, voxelCloud, slicePlane;
+let marchingCubes, marchingWireframe, pointCloud, voxelCloud;
 let gaussianCloud = null;
 let cameraHelpers = [];
 let scanLines = []; // animated rays during step 1
@@ -42,25 +42,27 @@ let worker;
 let currentStep = 0;
 let distancesBuffer = null;
 let pendingPoints = null; // point cloud from step 1, shown in step 2
-let slicePosCtrl = null;
 
-const SLICE_MIN_POS = -1.9;
-const SLICE_MAX_POS = 1.9;
-const SLICE_SCAN_LERP = 0.12;
 const POINT_REVEAL_DURATION_MS = 1100;
-const sliceScanState = {
-    active: false,
-    currentPos: params.slicePos,
-    targetPos: params.slicePos,
-    progress: 0,
-    pulsePhase: 0,
-};
+const VOXEL_REVEAL_DURATION_MS = 850;
 const pointRevealState = {
     active: false,
     startTime: 0,
     durationMs: POINT_REVEAL_DURATION_MS,
     totalPoints: 0,
     currentCount: 0,
+};
+const voxelRevealState = {
+    active: false,
+    startTime: 0,
+    durationMs: VOXEL_REVEAL_DURATION_MS,
+    totalPoints: 0,
+    currentCount: 0,
+};
+const voxelIntegrationState = {
+    active: false,
+    progress: 0,
+    pulsePhase: 0,
 };
 
 const DEPTH_RES = 48; // must match worker.js
@@ -424,9 +426,6 @@ function init() {
     voxelCloud.visible = false;
     scene.add(voxelCloud);
 
-    // Slicing Plane
-    setupSlicePlane();
-
     setupGUI();
     initWorker();
 
@@ -482,54 +481,6 @@ function renderMath() {
     // Our HTML has IDs formula-d and formula-w with math content inside or we can just put math in them
 }
 
-function setupSlicePlane() {
-    const canvas = document.createElement('canvas');
-    canvas.width = params.resolution;
-    canvas.height = params.resolution;
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.interpolation = THREE.NearestFilter;
-
-    const sliceMat = new THREE.MeshBasicMaterial({ 
-        map: texture, 
-        side: THREE.DoubleSide, 
-        transparent: true, 
-        opacity: 0.82,
-        color: new THREE.Color(0xffffff),
-    });
-    slicePlane = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), sliceMat);
-    slicePlane.rotation.y = Math.PI / 2;
-    slicePlane.visible = false;
-    scene.add(slicePlane);
-}
-
-function progressToSlicePos(progress) {
-    return SLICE_MIN_POS + (SLICE_MAX_POS - SLICE_MIN_POS) * progress;
-}
-
-function setSlicePosition(nextPos, { updateGui = false } = {}) {
-    params.slicePos = THREE.MathUtils.clamp(nextPos, SLICE_MIN_POS, SLICE_MAX_POS);
-    slicePlane.position.x = params.slicePos;
-    sliceScanState.currentPos = params.slicePos;
-    if (updateGui && slicePosCtrl) slicePosCtrl.updateDisplay();
-}
-
-function setSliceScanTarget(progress) {
-    sliceScanState.active = true;
-    sliceScanState.progress = progress;
-    sliceScanState.targetPos = progressToSlicePos(progress);
-}
-
-function stopSliceScan() {
-    sliceScanState.active = false;
-    sliceScanState.progress = 0;
-    sliceScanState.pulsePhase = 0;
-    sliceScanState.targetPos = params.slicePos;
-    if (slicePlane?.material) {
-        slicePlane.material.opacity = 0.82;
-        slicePlane.material.color.setRGB(1, 1, 1);
-    }
-}
-
 function easeOutCubic(t) {
     return 1 - (1 - t) ** 3;
 }
@@ -545,40 +496,36 @@ function stopPointReveal({ showAll = true } = {}) {
     pointCloud.material.size = 0.02;
 }
 
-function updateSliceTexture(distances) {
-    if (!slicePlane.visible) return;
-    
-    const canvas = slicePlane.material.map.image;
-    const ctx = canvas.getContext('2d');
-    const imgData = ctx.createImageData(canvas.width, canvas.height);
-    
-    const sliceIdx = Math.floor(((params.slicePos + 2.0) / 4.0) * params.resolution);
-    const clampedSlice = Math.max(0, Math.min(params.resolution - 1, sliceIdx));
-    
-    const res = params.resolution;
-    for (let y = 0; y < res; y++) {
-        for (let z = 0; z < res; z++) {
-            const idx = clampedSlice + y * res + z * res * res;
-            const d = distances[idx];
-            
-            // Map d (-mu to mu) to color
-            // Blue for negative (inside), Red for positive (outside), White for zero
-            const val = THREE.MathUtils.clamp(d / params.mu, -1, 1);
-            const r = val > 0 ? 255 : 255 * (1 + val);
-            const b = val < 0 ? 255 : 255 * (1 - val);
-            const g = 255 * (1 - Math.abs(val));
-
-            const pixelIdx = (y + z * res) * 4;
-            imgData.data[pixelIdx] = r;
-            imgData.data[pixelIdx + 1] = g;
-            imgData.data[pixelIdx + 2] = b;
-            imgData.data[pixelIdx + 3] = 255;
-        }
+function stopVoxelReveal({ showAll = true } = {}) {
+    voxelRevealState.active = false;
+    voxelRevealState.startTime = 0;
+    if (showAll && voxelRevealState.totalPoints > 0) {
+        voxelCloud.geometry.setDrawRange(0, voxelRevealState.totalPoints);
+        voxelRevealState.currentCount = voxelRevealState.totalPoints;
     }
-    
-    ctx.putImageData(imgData, 0, 0);
-    slicePlane.material.map.needsUpdate = true;
-    slicePlane.position.x = params.slicePos;
+    voxelCloud.material.opacity = params.showVoxels ? 0.4 : voxelCloud.material.opacity;
+    voxelCloud.material.size = 0.03;
+}
+
+function stopVoxelIntegration() {
+    voxelIntegrationState.active = false;
+    voxelIntegrationState.progress = 0;
+    voxelIntegrationState.pulsePhase = 0;
+    voxelCloud.material.color.setHex(0xebcb8b);
+    voxelCloud.material.opacity = params.showVoxels ? 0.4 : voxelCloud.material.opacity;
+    voxelCloud.material.size = 0.03;
+}
+
+function updateVoxelIntegration(progress) {
+    voxelIntegrationState.active = progress < 1;
+    voxelIntegrationState.progress = progress;
+    voxelCloud.material.opacity = 0.22 + progress * 0.28;
+    voxelCloud.material.size = 0.03 + progress * 0.012;
+    voxelCloud.material.color.setRGB(
+        0.92 + progress * 0.08,
+        0.80 + progress * 0.14,
+        0.30 + progress * 0.18,
+    );
 }
 
 function setupGUI() {
@@ -605,8 +552,31 @@ function setupGUI() {
         gaussianCloud.visible = params.showGaussians;
         scene.add(gaussianCloud);
     });
+    settings.add(params, 'resolution', 32, 96, 16).name('Resolution').onChange(() => {
+        marchingCubes.reset();
+        const nextScale = marchingCubes.scale.clone();
+        scene.remove(marchingCubes);
+        scene.remove(marchingWireframe);
+
+        const material = marchingCubes.material;
+        marchingCubes = new MarchingCubes(params.resolution, material, true, true, 100000);
+        marchingCubes.scale.copy(nextScale);
+        marchingCubes.visible = params.showMesh;
+        scene.add(marchingCubes);
+
+        marchingWireframe = new THREE.Mesh(
+            marchingCubes.geometry,
+            new THREE.MeshBasicMaterial({ color: 0x4c566a, wireframe: true, transparent: true, opacity: 0.35 })
+        );
+        marchingWireframe.scale.copy(nextScale);
+        marchingWireframe.visible = params.showMesh;
+        scene.add(marchingWireframe);
+
+        resetDemo();
+    });
     settings.add(params, 'mu', 0.05, 0.4).name('Truncation (μ)');
-    settings.add(params, 'noise', 0, 0.2).name('Noise');
+    settings.add(params, 'observationWeight', 0.1, 4.0, 0.1).name('Observation Weight');
+    settings.add(params, 'maxTSDFWeight', 1, 128, 1).name('Max TSDF Weight');
 
     const steps = gui.addFolder('Steps');
     const stepCtrls = [
@@ -630,16 +600,9 @@ function setupGUI() {
         .onChange(v => { voxelCloud.visible = v; });
     const ctrlMesh = view.add(params, 'showMesh').name('Show Mesh')
         .onChange(v => { marchingCubes.visible = v; marchingWireframe.visible = v; });
-    const ctrlSlice = view.add(params, 'showSlice').name('Show Slice')
-        .onChange(v => { slicePlane.visible = v; if (v && distancesBuffer) updateSliceTexture(distancesBuffer); });
-    slicePosCtrl = view.add(params, 'slicePos', SLICE_MIN_POS, SLICE_MAX_POS).name('Slice Position').onChange(() => {
-        stopSliceScan();
-        setSlicePosition(params.slicePos);
-        if (distancesBuffer) updateSliceTexture(distancesBuffer);
-    });
 
     // Expose controllers so triggerStep / worker handlers can update params + GUI in sync
-    window._visCtrl = { ctrlGaussians, ctrlCamera, ctrlPoints, ctrlVoxels, ctrlMesh, ctrlSlice };
+    window._visCtrl = { ctrlGaussians, ctrlCamera, ctrlPoints, ctrlVoxels, ctrlMesh };
 
     steps.open();
 }
@@ -693,18 +656,17 @@ function initWorker() {
                 updateStatus('Step 1 Complete: All depth maps rendered. Run Step 2 to reconstruct the point cloud.');
                 break;
 
-            case 'voxels': renderVoxels(data); updateStatus('Step 3 Complete: Active TSDF voxels identified.'); break;
+            case 'voxels':
+                renderVoxels(data);
+                break;
 
             case 'fusing_progress': {
                 const percent = (data.progress * 100).toFixed(0);
                 distancesBuffer = data.distances;
-                setSliceScanTarget(data.progress);
+                updateVoxelIntegration(data.progress);
                 updateStatus(`Step 4: Integrating TSDF... ${percent}%`);
-                if (params.showSlice && !sliceScanState.active) updateSliceTexture(data.distances);
                 if (data.isDone) {
-                    stopSliceScan();
-                    setSlicePosition(progressToSlicePos(1), { updateGui: true });
-                    if (params.showSlice) updateSliceTexture(data.distances);
+                    stopVoxelIntegration();
                     updateStatus(`Step 4 Complete: TSDF field integrated in ${data.time.toFixed(2)}ms. Run Step 5 to extract the mesh.`);
                 }
                 break;
@@ -717,7 +679,6 @@ function initWorker() {
                 setVis(c.ctrlGaussians, false);
                 setVis(c.ctrlPoints, false);
                 setVis(c.ctrlVoxels, false);
-                setVis(c.ctrlSlice, false);
                 setVis(c.ctrlMesh, true);
                 updateStatus('Step 5 Complete: Mesh Extracted via Marching Cubes.');
                 break;
@@ -728,8 +689,8 @@ function initWorker() {
                 pendingPoints = null;
                 distancesBuffer = null;
                 stopPointReveal({ showAll: false });
-                stopSliceScan();
-                setSlicePosition(0, { updateGui: true });
+                stopVoxelReveal({ showAll: false });
+                stopVoxelIntegration();
                 highlightStep(0); // clears all highlights
                 clearScanRays();
                 scene.remove(gaussianCloud);
@@ -740,7 +701,6 @@ function initWorker() {
                 setVis(rc.ctrlCamera, true);
                 setVis(rc.ctrlPoints, false);
                 setVis(rc.ctrlVoxels, false);
-                setVis(rc.ctrlSlice, false);
                 setVis(rc.ctrlMesh, false);
                 cameraHelpers.forEach(h => {
                     if (h.depthCtx) {
@@ -769,7 +729,7 @@ function highlightStep(step) {
 }
 
 function triggerStep(step) {
-    const { ctrlGaussians, ctrlCamera, ctrlPoints, ctrlVoxels, ctrlMesh, ctrlSlice } = window._visCtrl;
+    const { ctrlGaussians, ctrlCamera, ctrlPoints, ctrlVoxels, ctrlMesh } = window._visCtrl;
 
     if (step === 1) {
         currentStep = 1;
@@ -779,7 +739,6 @@ function triggerStep(step) {
         setVis(ctrlCamera, true);
         setVis(ctrlPoints, false);
         setVis(ctrlVoxels, false);
-        setVis(ctrlSlice, false);
         setVis(ctrlMesh, false);
         sendInitToWorker();
         worker.postMessage({ type: 'step1_render' });
@@ -794,7 +753,6 @@ function triggerStep(step) {
         setVis(ctrlCamera, false);
         setVis(ctrlPoints, true);
         setVis(ctrlVoxels, false);
-        setVis(ctrlSlice, false);
         setVis(ctrlMesh, false);
         renderPoints(pendingPoints);
         updateStatus('Step 2: Reconstructing point cloud...');
@@ -803,11 +761,11 @@ function triggerStep(step) {
         if (currentStep < 2) return updateStatus('Error: Complete Step 2 first.');
         currentStep = 3;
         highlightStep(3);
+        updateStatus('Step 3: Marking active TSDF voxels...');
         setVis(ctrlGaussians, false);
         setVis(ctrlCamera, false);
         setVis(ctrlPoints, true);
         setVis(ctrlVoxels, true);
-        setVis(ctrlSlice, false);
         setVis(ctrlMesh, false);
         worker.postMessage({ type: 'step3_voxelize' });
 
@@ -815,13 +773,12 @@ function triggerStep(step) {
         if (currentStep < 3) return updateStatus('Error: Complete Step 3 first.');
         currentStep = 4;
         highlightStep(4);
-        setSlicePosition(SLICE_MIN_POS, { updateGui: true });
-        setSliceScanTarget(0);
+        stopVoxelReveal();
+        updateStatus('Step 4: Integrating TSDF...');
         setVis(ctrlGaussians, false);
         setVis(ctrlCamera, false);
         setVis(ctrlPoints, false);
         setVis(ctrlVoxels, true);
-        setVis(ctrlSlice, true);
         setVis(ctrlMesh, false);
         worker.postMessage({ type: 'step4_fuse' });
 
@@ -854,7 +811,16 @@ function renderPoints(data) {
 
 function renderVoxels(data) {
     voxelCloud.geometry.setAttribute('position', new THREE.BufferAttribute(data, 3));
+    voxelCloud.geometry.setDrawRange(0, 0);
+    voxelCloud.material.opacity = 0.08;
+    voxelCloud.material.size = 0.055;
+    voxelCloud.material.color.setHex(0xebcb8b);
+    voxelRevealState.active = true;
+    voxelRevealState.startTime = performance.now();
+    voxelRevealState.totalPoints = data.length / 3;
+    voxelRevealState.currentCount = 0;
     voxelCloud.visible = params.showVoxels;
+    stopVoxelIntegration();
 }
 
 function renderMesh(distances) {
@@ -875,6 +841,8 @@ function sendInitToWorker() {
             size: params.resolution,
             extent: 2.0,
             mu: params.mu,
+            observationWeight: params.observationWeight,
+            maxTSDFWeight: params.maxTSDFWeight,
             type: params.type,
             noise: params.noise,
             outliers: params.outliers,
@@ -929,18 +897,31 @@ function animate() {
         }
     }
 
-    if (slicePlane.visible && distancesBuffer && sliceScanState.active) {
-        sliceScanState.pulsePhase += 0.12;
-        const nextPos = THREE.MathUtils.lerp(sliceScanState.currentPos, sliceScanState.targetPos, SLICE_SCAN_LERP);
-        const moved = Math.abs(nextPos - sliceScanState.currentPos);
-        if (moved > 0.0005) {
-            setSlicePosition(nextPos, { updateGui: true });
-            updateSliceTexture(distancesBuffer);
+    if (voxelCloud.visible && voxelRevealState.active) {
+        const elapsed = performance.now() - voxelRevealState.startTime;
+        const t = Math.min(1, elapsed / voxelRevealState.durationMs);
+        const eased = easeOutCubic(t);
+        const nextCount = Math.floor(voxelRevealState.totalPoints * eased);
+
+        if (nextCount !== voxelRevealState.currentCount) {
+            voxelCloud.geometry.setDrawRange(0, nextCount);
+            voxelRevealState.currentCount = nextCount;
         }
 
-        const pulse = 0.5 + 0.5 * Math.sin(sliceScanState.pulsePhase);
-        slicePlane.material.opacity = 0.7 + pulse * 0.2;
-        slicePlane.material.color.setRGB(1.0, 0.92 + pulse * 0.08, 0.92 + pulse * 0.05);
+        voxelCloud.material.opacity = 0.08 + eased * 0.32;
+        voxelCloud.material.size = 0.055 - eased * 0.025;
+
+        if (t >= 1) {
+            stopVoxelReveal();
+            updateStatus('Step 3 Complete: Active TSDF voxels identified.');
+        }
+    }
+
+    if (voxelCloud.visible && voxelIntegrationState.active) {
+        voxelIntegrationState.pulsePhase += 0.16;
+        const pulse = 0.5 + 0.5 * Math.sin(voxelIntegrationState.pulsePhase);
+        voxelCloud.material.size = 0.036 + voxelIntegrationState.progress * 0.006 + pulse * 0.004;
+        voxelCloud.material.opacity = Math.max(voxelCloud.material.opacity, 0.30 + voxelIntegrationState.progress * 0.12 + pulse * 0.05);
     }
 
     renderer.render(scene, camera);

@@ -100,7 +100,7 @@
                                 <li><strong>Render Depth Maps</strong>: Each virtual camera looks toward the object and records the first surface hit along every ray. This produces a small depth image per camera, similar to what a depth sensor or differentiable renderer would provide.</li>
                                 <li><strong>Reconstruct Point Cloud</strong>: Every valid depth pixel is lifted back into 3D space to form a point cloud. The demo also estimates a surface normal at each hit point, because TSDF integration needs both a position and an orientation to decide whether a voxel is in front of or behind the surface.</li>
                                 <li><strong>Mark Active Voxels</strong>: The point cloud is not yet a volume. In this step, the algorithm finds which voxels lie within the truncation band around the observed points. The yellow voxels show the active region where future TSDF updates are allowed to happen.</li>
-                                <li><strong>Integrate TSDF</strong>: For each point, nearby voxels receive a signed distance value computed along the point normal. Repeated observations are merged by weighted averaging, so noise is smoothed out and the scalar field becomes more stable. The animated slice reveals this hidden 3D field over time: warm and cool colors indicate opposite distance signs, while the bright transition region marks the future surface.</li>
+                                <li><strong>Integrate TSDF</strong>: For each point, nearby voxels receive a signed distance value computed along the point normal. Repeated observations are merged by weighted averaging, so noise is smoothed out and the scalar field becomes more stable. This step builds the hidden volumetric field that Marching Cubes will later convert into a surface.</li>
                                 <li><strong>Extract Mesh</strong>: Marching Cubes scans the voxel grid and connects places where the TSDF crosses zero. This converts the invisible scalar field into an explicit triangle mesh that can be shaded and inspected.</li>
                             </ol>
                             <p style="font-size: 0.8rem; font-style: italic; opacity: 0.7;">In production systems, steps 3 and 4 are usually interleaved continuously as new frames arrive. They are separated here to make the data flow easier to see.</p>
@@ -112,7 +112,7 @@
                                 <li><strong>Render Depth Maps</strong>：每個虛擬相機朝物體中心發射視線，記錄每條光線第一次撞到表面的深度。這會生成每個相機自己的深度圖，概念上類似深度感測器或可微渲染器輸出的幾何觀測。</li>
                                 <li><strong>Reconstruct Point Cloud</strong>：把每個有效的深度像素重新投影回 3D 空間，形成點雲。這個 Demo 也同時計算每個點的表面法向量，因為 TSDF 積分不只需要位置，還需要知道體素位於表面的前方還是後方。</li>
                                 <li><strong>Mark Active Voxels</strong>：點雲本身還不是體積表示。在這一步中，演算法會找出哪些體素落在觀測點周圍的截斷帶內。畫面中的黃色體素代表會參與後續 TSDF 更新的 active region。</li>
-                                <li><strong>Integrate TSDF</strong>：對每個點而言，鄰近體素會根據該點的法向量收到一個符號距離值。多次觀測會透過加權平均整合，因此雜訊會被平滑，數值場也會逐漸穩定。動畫化的切片用來顯示這個平常看不見的 3D 場：冷暖色代表相反的距離符號，而接近亮色過渡的位置就是未來表面形成的地方。</li>
+                                <li><strong>Integrate TSDF</strong>：對每個點而言，鄰近體素會根據該點的法向量收到一個符號距離值。多次觀測會透過加權平均整合，因此雜訊會被平滑，數值場也會逐漸穩定。這一步建立的是隱藏在體積中的數值場，之後 Marching Cubes 會再把它轉換成可見表面。</li>
                                 <li><strong>Extract Mesh</strong>：Marching Cubes 會掃描整個體素網格，找出 TSDF 穿越零值的位置並連接成三角形。這一步把原本不可見的純量場轉換成可直接渲染與檢視的顯式網格。</li>
                             </ol>
                             <p style="font-size: 0.8rem; font-style: italic; opacity: 0.7;">在真實系統中，第 3 與第 4 步通常會隨著新影像輸入持續交錯進行。這裡刻意拆開，是為了讓資料流與演算法角色更容易理解。</p>
@@ -127,7 +127,6 @@
                                 <li><strong>Camera pyramids + scan rays</strong>: indicate where observations come from and which directions are sampled.</li>
                                 <li><strong>Red points</strong>: discrete surface samples reconstructed from depth images, including synthetic noise and outliers.</li>
                                 <li><strong>Yellow voxels</strong>: cells that fall inside the truncation neighborhood of the points and therefore participate in fusion.</li>
-                                <li><strong>Animated slice</strong>: a moving cross-section through the TSDF volume. Near-zero values indicate where the final surface will emerge.</li>
                                 <li><strong>Blue mesh</strong>: the final zero-isosurface extracted from the fused field.</li>
                             </ul>
                         </div>
@@ -136,7 +135,6 @@
                                 <li><strong>相機金字塔與掃描射線</strong>：表示觀測是從哪裡來，以及目前取樣的方向。</li>
                                 <li><strong>紅色點雲</strong>：由深度圖回投影得到的離散表面樣本，其中包含刻意加入的雜訊與離群點。</li>
                                 <li><strong>黃色體素</strong>：落在點雲截斷鄰域內、因此會參與融合計算的格子。</li>
-                                <li><strong>動畫切片</strong>：穿過 TSDF 體積的移動截面。接近零的區域代表最終表面即將出現的位置。</li>
                                 <li><strong>藍色網格</strong>：從融合後數值場提取出的最終零等值面。</li>
                             </ul>
                         </div>
