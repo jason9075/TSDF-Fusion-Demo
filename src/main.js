@@ -87,6 +87,9 @@ function createGaussianCloud(type, N = params.gaussianCount) {
     const color = new THREE.Color();
     const yAxis = new THREE.Vector3(0, 1, 0);
     const normal = new THREE.Vector3();
+    // Store final gaussian positions + surface normals so the worker can build a
+    // point cloud that mirrors this visual distribution (including artifacts).
+    const rawPoints = new Float32Array(N * 6); // [x,y,z,nx,ny,nz] per gaussian
 
     for (let i = 0; i < N; i++) {
         // --- Sample base surface position & normal ---
@@ -166,6 +169,14 @@ function createGaussianCloud(type, N = params.gaussianCount) {
             lig = 0.55 + Math.random() * 0.20;
         }
 
+        // Record final position + surface normal for worker point-cloud sampling.
+        rawPoints[i * 6]     = x;
+        rawPoints[i * 6 + 1] = y;
+        rawPoints[i * 6 + 2] = z;
+        rawPoints[i * 6 + 3] = nx;
+        rawPoints[i * 6 + 4] = ny;
+        rawPoints[i * 6 + 5] = nz;
+
         dummy.position.set(x, y, z);
         dummy.scale.set(sx, sy, sz);
         normal.set(nx, ny, nz).normalize();
@@ -180,6 +191,7 @@ function createGaussianCloud(type, N = params.gaussianCount) {
 
     cloud.instanceMatrix.needsUpdate = true;
     if (cloud.instanceColor) cloud.instanceColor.needsUpdate = true;
+    cloud.rawPoints = rawPoints;
     return cloud;
 }
 
@@ -846,6 +858,9 @@ function sendInitToWorker() {
             type: params.type,
             noise: params.noise,
             outliers: params.outliers,
+            // Pass gaussian positions so the worker can build a point cloud that
+            // reflects the gsplat distribution (artifacts included).
+            gaussianPoints: gaussianCloud?.rawPoints?.slice() ?? null,
         },
     });
 }

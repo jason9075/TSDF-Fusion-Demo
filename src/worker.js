@@ -6,6 +6,7 @@ let sceneType = 'sphere';
 let noiseStd = 0.02;
 let outlierRate = 0.05;
 let observationWeight = 1.0;
+let gaussianPoints = null; // Float32Array [x,y,z,nx,ny,nz] × N from main thread
 
 /** Must match the constants in main.js */
 const CAM_COUNT = 8;
@@ -24,6 +25,7 @@ self.onmessage = (e) => {
             noiseStd = data.noise || 0.02;
             outlierRate = data.outliers || 0.05;
             observationWeight = data.observationWeight ?? 1.0;
+            gaussianPoints = data.gaussianPoints ?? null;
             currentPoints = null;
             self.postMessage({ type: 'ready' });
             break;
@@ -56,6 +58,7 @@ self.onmessage = (e) => {
                 volume.weights.fill(0.0);
             }
             currentPoints = null;
+            gaussianPoints = null;
             self.postMessage({ type: 'reset_done' });
             break;
     }
@@ -97,8 +100,9 @@ function getCameraAxes(camIdx) {
 async function renderDepthMapsProgressive() {
     const halfFOV = (CAM_FOV_DEG * Math.PI / 180) / 2;
     const tanFOV = Math.tan(halfFOV);
-    const allPoints = [];
 
+    // Render depth maps camera-by-camera — purely for the visual animation.
+    // The actual point cloud is sampled from the gaussian data below.
     for (let camIdx = 0; camIdx < CAM_COUNT; camIdx++) {
         const { pos, fwd, right, up } = getCameraAxes(camIdx);
         const depthMap = new Float32Array(DEPTH_RES * DEPTH_RES).fill(-1);
@@ -107,34 +111,104 @@ async function renderDepthMapsProgressive() {
             for (let px = 0; px < DEPTH_RES; px++) {
                 const ndcX = (px + 0.5) / DEPTH_RES * 2 - 1;
                 const ndcY = 1 - (py + 0.5) / DEPTH_RES * 2;
-
-                // Build ray direction in world space
                 const rdx = fwd[0] + ndcX * tanFOV * right[0] + ndcY * tanFOV * up[0];
                 const rdy = fwd[1] + ndcX * tanFOV * right[1] + ndcY * tanFOV * up[1];
                 const rdz = fwd[2] + ndcX * tanFOV * right[2] + ndcY * tanFOV * up[2];
                 const rdLen = Math.sqrt(rdx ** 2 + rdy ** 2 + rdz ** 2);
                 const dir = [rdx / rdLen, rdy / rdLen, rdz / rdLen];
+                const t = sceneType === 'sphere' ? raySphere(pos, dir) : rayTorus(pos, dir);
+                if (t >= 0) depthMap[py * DEPTH_RES + px] = t;
+            }
+        }
 
-                const t = sceneType === 'sphere'
-                    ? raySphere(pos, dir)
-                    : rayTorus(pos, dir);
+        self.postMessage({ type: 'depth_progress', data: { camIndex: camIdx, depthMap } });
+        await new Promise(r => setTimeout(r, 60));
+    }
 
+    // Build the point cloud to match the gsplat visual distribution.
+    currentPoints = gaussianPoints
+        ? samplePointCloudFromGaussians()
+        : samplePointCloudFromSurface();
+
+    self.postMessage({ type: 'points', data: currentPoints });
+}
+
+/**
+ * Sample a dense point cloud from the gaussian positions sent by the main thread.
+ * Floaters, needles, and blobs in the gsplat are naturally included because their
+ * positions (with artifact offsets already applied) are stored in gaussianPoints.
+ * Each gaussian center is oversampled with small noise to reach density comparable
+ * to the raycast-based approach.
+ */
+function samplePointCloudFromGaussians() {
+    const N = gaussianPoints.length / 6; // [x,y,z,nx,ny,nz] per entry
+    // Target density ≈ what 8 cameras × 48×48 pixels × ~65% hit rate gives
+    const targetTotal = Math.round(CAM_COUNT * DEPTH_RES * DEPTH_RES * 0.65);
+    const oversample  = Math.max(1, Math.round(targetTotal / N));
+    const points = [];
+
+    for (let i = 0; i < N; i++) {
+        const gx = gaussianPoints[i * 6];
+        const gy = gaussianPoints[i * 6 + 1];
+        const gz = gaussianPoints[i * 6 + 2];
+        const nx = gaussianPoints[i * 6 + 3];
+        const ny = gaussianPoints[i * 6 + 4];
+        const nz = gaussianPoints[i * 6 + 5];
+
+        for (let j = 0; j < oversample; j++) {
+            points.push(
+                gx + gaussianRandom() * noiseStd,
+                gy + gaussianRandom() * noiseStd,
+                gz + gaussianRandom() * noiseStd,
+                nx, ny, nz, observationWeight,
+            );
+        }
+    }
+
+    // Gsplat floaters are already in the data as displaced positions.
+    // Add a small fraction of extra random outliers on top (simulates
+    // back-projection failures from low-opacity regions).
+    const extraOutliers = Math.floor(points.length / 7 * outlierRate * 0.3);
+    for (let i = 0; i < extraOutliers; i++) {
+        const ox = (Math.random() - 0.5) * 4;
+        const oy = (Math.random() - 0.5) * 4;
+        const oz = (Math.random() - 0.5) * 4;
+        let onx = Math.random() - 0.5, ony = Math.random() - 0.5, onz = Math.random() - 0.5;
+        const onLen = Math.sqrt(onx ** 2 + ony ** 2 + onz ** 2);
+        points.push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, observationWeight);
+    }
+
+    return new Float32Array(points);
+}
+
+/**
+ * Fallback: build point cloud by back-projecting depth map hits against the
+ * analytical surface. Used when no gaussian data is available.
+ */
+function samplePointCloudFromSurface() {
+    const halfFOV = (CAM_FOV_DEG * Math.PI / 180) / 2;
+    const tanFOV  = Math.tan(halfFOV);
+    const allPoints = [];
+
+    for (let camIdx = 0; camIdx < CAM_COUNT; camIdx++) {
+        const { pos, fwd, right, up } = getCameraAxes(camIdx);
+        for (let py = 0; py < DEPTH_RES; py++) {
+            for (let px = 0; px < DEPTH_RES; px++) {
+                const ndcX = (px + 0.5) / DEPTH_RES * 2 - 1;
+                const ndcY = 1 - (py + 0.5) / DEPTH_RES * 2;
+                const rdx = fwd[0] + ndcX * tanFOV * right[0] + ndcY * tanFOV * up[0];
+                const rdy = fwd[1] + ndcX * tanFOV * right[1] + ndcY * tanFOV * up[1];
+                const rdz = fwd[2] + ndcX * tanFOV * right[2] + ndcY * tanFOV * up[2];
+                const rdLen = Math.sqrt(rdx ** 2 + rdy ** 2 + rdz ** 2);
+                const dir = [rdx / rdLen, rdy / rdLen, rdz / rdLen];
+                const t = sceneType === 'sphere' ? raySphere(pos, dir) : rayTorus(pos, dir);
                 if (t < 0) continue;
-
-                depthMap[py * DEPTH_RES + px] = t;
-
-                // Back-project hit point
-                const hx = pos[0] + t * dir[0];
-                const hy = pos[1] + t * dir[1];
-                const hz = pos[2] + t * dir[2];
-
-                // Surface normal
+                const hx = pos[0] + t * dir[0], hy = pos[1] + t * dir[1], hz = pos[2] + t * dir[2];
                 let nx, ny, nz;
                 if (sceneType === 'sphere') {
                     const nLen = Math.sqrt(hx ** 2 + hy ** 2 + hz ** 2);
                     nx = hx / nLen; ny = hy / nLen; nz = hz / nLen;
                 } else {
-                    // Numerical SDF gradient
                     const eps = 0.001;
                     const gx = sdTorus([hx + eps, hy, hz]) - sdTorus([hx - eps, hy, hz]);
                     const gy = sdTorus([hx, hy + eps, hz]) - sdTorus([hx, hy - eps, hz]);
@@ -142,12 +216,7 @@ async function renderDepthMapsProgressive() {
                     const gLen = Math.sqrt(gx ** 2 + gy ** 2 + gz ** 2);
                     nx = gx / gLen; ny = gy / gLen; nz = gz / gLen;
                 }
-
-                // Flip normal if it points away from camera
-                if (nx * (-dir[0]) + ny * (-dir[1]) + nz * (-dir[2]) < 0) {
-                    nx = -nx; ny = -ny; nz = -nz;
-                }
-
+                if (nx * (-dir[0]) + ny * (-dir[1]) + nz * (-dir[2]) < 0) { nx = -nx; ny = -ny; nz = -nz; }
                 allPoints.push(
                     hx + gaussianRandom() * noiseStd,
                     hy + gaussianRandom() * noiseStd,
@@ -156,26 +225,16 @@ async function renderDepthMapsProgressive() {
                 );
             }
         }
-
-        self.postMessage({ type: 'depth_progress', data: { camIndex: camIdx, depthMap } });
-        await new Promise(r => setTimeout(r, 60));
     }
 
-    // Add outliers to simulate 3DGS floaters
     const numOutliers = Math.floor(allPoints.length / 7 * outlierRate);
     for (let i = 0; i < numOutliers; i++) {
-        const ox = (Math.random() - 0.5) * 4;
-        const oy = (Math.random() - 0.5) * 4;
-        const oz = (Math.random() - 0.5) * 4;
-        let onx = Math.random() - 0.5;
-        let ony = Math.random() - 0.5;
-        let onz = Math.random() - 0.5;
+        const ox = (Math.random() - 0.5) * 4, oy = (Math.random() - 0.5) * 4, oz = (Math.random() - 0.5) * 4;
+        let onx = Math.random() - 0.5, ony = Math.random() - 0.5, onz = Math.random() - 0.5;
         const onLen = Math.sqrt(onx ** 2 + ony ** 2 + onz ** 2);
         allPoints.push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, observationWeight);
     }
-
-    currentPoints = new Float32Array(allPoints);
-    self.postMessage({ type: 'points', data: currentPoints });
+    return new Float32Array(allPoints);
 }
 
 // ---------------------------------------------------------------------------
