@@ -37,10 +37,23 @@ const params = {
 
 let scene, camera, renderer, controls;
 let marchingCubes, marchingWireframe, pointCloud, voxelCloud;
-let gaussianCloud = null;
+let gaussianClouds = [];
 let gridHelper = null;
 let cameraHelpers = [];
 let scanLines = []; // animated rays during step 1
+
+// Auto-play state
+const autoPlayState = { playing: false, paused: false };
+let resumeResolve = null;
+const workerResolvers = new Map(); // type → resolve, for async worker communication
+
+// What the current step/play WANTS to show — independent of user toggle permissions.
+// gaussians: -1 = hide all, 'all' = show all sectors, 0–7 = show specific sector
+const stepWants = { gaussians: 'all', points: false, voxels: false, mesh: false, camera: false };
+
+// Accumulated point positions from all previously completed cameras (auto-play only)
+let accumulatedPointPositions = null;
+
 let worker;
 let currentStep = 0;
 let distancesBuffer = null;
@@ -54,6 +67,7 @@ const pointRevealState = {
     durationMs: POINT_REVEAL_DURATION_MS,
     totalPoints: 0,
     currentCount: 0,
+    prevCount: 0, // static portion from accumulated cameras (auto-play)
 };
 const voxelRevealState = {
     active: false,
@@ -71,61 +85,63 @@ const voxelIntegrationState = {
 const DEPTH_RES = 48; // must match worker.js
 
 /**
- * Build a cloud of semi-transparent colored ellipsoids that visually represents
- * a 3D Gaussian Splatting scene. Each instance is a flattened ellipsoid (thin
- * in the surface-normal direction, wide tangentially) — the hallmark look of GSplat.
- * @param {'sphere'|'torus'} type
+ * Build 8 sector meshes representing the 3DGS scene, one per camera viewing angle.
+ * Each mesh contains the gaussians whose XZ angle falls in that camera's field of view
+ * (sector c = the 45° wedge opposite camera c).  This matches the angle-based assignment
+ * in the worker so visual sectors and computed point clouds are always consistent.
+ * @returns {THREE.InstancedMesh[]} Array of 8 meshes
  */
 function createGaussianCloud(type, N = params.gaussianCount, noise = params.gsplatNoise) {
     const geo = new THREE.SphereGeometry(1, 5, 4);
-    const mat = new THREE.MeshBasicMaterial({
+    const baseMat = new THREE.MeshBasicMaterial({
         transparent: true,
         opacity: 0.40,
         depthWrite: false,
         blending: THREE.AdditiveBlending,
     });
 
-    const cloud = new THREE.InstancedMesh(geo, mat, N);
+    const SECTOR_COUNT = CAM_COUNT_MAIN;
+    const sectorSize = (Math.PI * 2) / SECTOR_COUNT;
+
+    const sectors = Array.from({ length: SECTOR_COUNT }, () => ({
+        matrices: [],
+        colors: [],
+        rawPoints: [],
+    }));
+
     const dummy = new THREE.Object3D();
     const color = new THREE.Color();
     const yAxis = new THREE.Vector3(0, 1, 0);
     const normal = new THREE.Vector3();
-    // Store final gaussian positions + surface normals so the worker can build a
-    // point cloud that mirrors this visual distribution (including artifacts).
-    const rawPoints = new Float32Array(N * 6); // [x,y,z,nx,ny,nz] per gaussian
 
     for (let i = 0; i < N; i++) {
-        // --- Sample base surface position & normal ---
         let x, y, z, nx, ny, nz;
         if (type === 'sphere') {
             const phi   = Math.random() * Math.PI * 2;
             const theta = Math.acos(2 * Math.random() - 1);
+            // Y-up convention: equator in XZ plane, poles at ±Y — matches camera ring
             nx = Math.sin(theta) * Math.cos(phi);
-            ny = Math.sin(theta) * Math.sin(phi);
-            nz = Math.cos(theta);
+            ny = Math.cos(theta);
+            nz = Math.sin(theta) * Math.sin(phi);
             x = nx; y = ny; z = nz;
         } else {
             const phi   = Math.random() * Math.PI * 2;
             const theta = Math.random() * Math.PI * 2;
             const R = 1.0, r = 0.4;
+            // Y-up convention: torus ring in XZ plane — matches sdTorus in worker
             x  = (R + r * Math.cos(theta)) * Math.cos(phi);
-            y  = (R + r * Math.cos(theta)) * Math.sin(phi);
-            z  = r * Math.sin(theta);
+            y  = r * Math.sin(theta);
+            z  = (R + r * Math.cos(theta)) * Math.sin(phi);
             nx = Math.cos(theta) * Math.cos(phi);
-            ny = Math.cos(theta) * Math.sin(phi);
-            nz = Math.sin(theta);
+            ny = Math.sin(theta);
+            nz = Math.cos(theta) * Math.sin(phi);
         }
 
         const baseHue = (Math.atan2(nz, nx) / (Math.PI * 2) + 0.5 + ny * 0.15) % 1.0;
-
-        // --- Artifact type — probabilities and jitter scale with gsplatNoise (0..1) ---
-        // At noise=0: all gaussians are clean surface splats with no position offset.
-        // At noise=1: full artifact mix (floaters 8%, needles 10%, blobs 7%).
         const roll = Math.random();
         let sx, sy, sz, hue, sat, lig;
 
         if (roll < 0.08 * noise) {
-            // Floater — drifts off the surface, common near object boundaries
             const drift = (0.2 + Math.random() * 0.6) * noise;
             x += nx * drift + (Math.random() - 0.5) * 0.25 * noise;
             y += ny * drift + (Math.random() - 0.5) * 0.25 * noise;
@@ -134,9 +150,7 @@ function createGaussianCloud(type, N = params.gaussianCount, noise = params.gspl
             sy = 0.025 + Math.random() * 0.05;
             hue = Math.random();
             sat = 0.25; lig = 0.20 + Math.random() * 0.12;
-
         } else if (roll < (0.08 + 0.10) * noise) {
-            // Needle — very elongated in one tangential direction.
             x += (Math.random() - 0.5) * 0.04 * noise;
             y += (Math.random() - 0.5) * 0.04 * noise;
             z += (Math.random() - 0.5) * 0.04 * noise;
@@ -145,9 +159,7 @@ function createGaussianCloud(type, N = params.gaussianCount, noise = params.gspl
             sz = 0.008 + Math.random() * 0.01;
             hue = baseHue;
             sat = 0.55; lig = 0.35 + Math.random() * 0.2;
-
         } else if (roll < (0.08 + 0.10 + 0.07) * noise) {
-            // Oversized blob — large Gaussian covering a uniform region.
             x += (Math.random() - 0.5) * 0.05 * noise;
             y += (Math.random() - 0.5) * 0.05 * noise;
             z += (Math.random() - 0.5) * 0.05 * noise;
@@ -156,9 +168,7 @@ function createGaussianCloud(type, N = params.gaussianCount, noise = params.gspl
             sz = 0.14 + Math.random() * 0.14;
             hue = (baseHue + 0.04) % 1.0;
             sat = 0.35; lig = 0.25 + Math.random() * 0.12;
-
         } else {
-            // Normal surface Gaussian — flat, asymmetric tangential ellipsoid.
             x += (Math.random() - 0.5) * 0.06 * noise;
             y += (Math.random() - 0.5) * 0.06 * noise;
             z += (Math.random() - 0.5) * 0.06 * noise;
@@ -170,13 +180,11 @@ function createGaussianCloud(type, N = params.gaussianCount, noise = params.gspl
             lig = 0.55 + Math.random() * 0.20;
         }
 
-        // Record final position + surface normal for worker point-cloud sampling.
-        rawPoints[i * 6]     = x;
-        rawPoints[i * 6 + 1] = y;
-        rawPoints[i * 6 + 2] = z;
-        rawPoints[i * 6 + 3] = nx;
-        rawPoints[i * 6 + 4] = ny;
-        rawPoints[i * 6 + 5] = nz;
+        // Sector assignment — must match worker's getAngleSector formula
+        const normalizedAngle = ((Math.atan2(z, x) + Math.PI * 2) % (Math.PI * 2));
+        const sectorIdx = Math.floor(normalizedAngle / sectorSize);
+
+        sectors[sectorIdx].rawPoints.push(x, y, z, nx, ny, nz);
 
         dummy.position.set(x, y, z);
         dummy.scale.set(sx, sy, sz);
@@ -184,16 +192,34 @@ function createGaussianCloud(type, N = params.gaussianCount, noise = params.gspl
         dummy.quaternion.setFromUnitVectors(yAxis, normal);
         dummy.rotateOnWorldAxis(normal, Math.random() * Math.PI * 2);
         dummy.updateMatrix();
-        cloud.setMatrixAt(i, dummy.matrix);
+        sectors[sectorIdx].matrices.push(dummy.matrix.clone());
 
         color.setHSL(hue, sat, lig);
-        cloud.setColorAt(i, color);
+        sectors[sectorIdx].colors.push(color.clone());
     }
 
-    cloud.instanceMatrix.needsUpdate = true;
-    if (cloud.instanceColor) cloud.instanceColor.needsUpdate = true;
-    cloud.rawPoints = rawPoints;
-    return cloud;
+    return sectors.map(sector => {
+        const count = sector.matrices.length;
+        const mesh = new THREE.InstancedMesh(geo, baseMat.clone(), count || 1);
+        mesh.count = count;
+        if (count > 0) {
+            sector.matrices.forEach((mat, i) => mesh.setMatrixAt(i, mat));
+            sector.colors.forEach((c, i) => mesh.setColorAt(i, c));
+            mesh.instanceMatrix.needsUpdate = true;
+            if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+        }
+        mesh.rawPoints = new Float32Array(sector.rawPoints);
+        return mesh;
+    });
+}
+
+/** Merge all sector rawPoints into a single Float32Array for the worker. */
+function getGaussianRawPoints() {
+    const totalLen = gaussianClouds.reduce((s, m) => s + m.rawPoints.length, 0);
+    const merged = new Float32Array(totalLen);
+    let off = 0;
+    for (const m of gaussianClouds) { merged.set(m.rawPoints, off); off += m.rawPoints.length; }
+    return merged;
 }
 
 /**
@@ -372,8 +398,8 @@ function init() {
     scene.add(gridHelper);
 
     // Gaussian cloud — represents the 3DGS scene the virtual cameras will scan
-    gaussianCloud = createGaussianCloud(params.type);
-    scene.add(gaussianCloud);
+    gaussianClouds = createGaussianCloud(params.type);
+    gaussianClouds.forEach(m => scene.add(m));
 
     // Virtual Cameras — ring of cameras around the object, each pointing inward
     // This matches the 3DGS → TSDF pipeline: render depth/opacity maps from N viewpoints
@@ -511,7 +537,7 @@ function stopPointReveal({ showAll = true } = {}) {
         pointCloud.geometry.setDrawRange(0, pointRevealState.totalPoints);
         pointRevealState.currentCount = pointRevealState.totalPoints;
     }
-    pointCloud.material.opacity = params.showPoints ? 0.8 : pointCloud.material.opacity;
+    pointCloud.material.opacity = 0.8;
     pointCloud.material.size = 0.02;
 }
 
@@ -619,6 +645,14 @@ function setupGUI() {
         camera.position.copy(controls.target).add(offset);
         controls.update();
     });
+    let playPauseCtrl;
+    params.togglePlay = () => {
+        if (!autoPlayState.playing) startAutoPlay();
+        else togglePause();
+    };
+    playPauseCtrl = gui.add(params, 'togglePlay').name('▶ Auto Play');
+    window._playPauseCtrl = playPauseCtrl;
+
     // Shared voxel grid resolution — must be identical for TSDF volume and MarchingCubes
     // because MC reads the TSDF distances array directly (marchingCubes.field.set(distances)).
     params.voxelSizeDisplay = `${(4.0 / params.resolution).toFixed(4)}`;
@@ -656,21 +690,22 @@ function setupGUI() {
     // --- Gaussian Splat (affects Step 1) ---
     const gsplatFolder = gui.addFolder('Gaussian Splat (Step 1)');
     gsplatFolder.add(params, 'type', ['sphere', 'torus']).name('Surface Type').onChange(v => {
-        scene.remove(gaussianCloud);
-        gaussianCloud = createGaussianCloud(v);
-        scene.add(gaussianCloud);
+        gaussianClouds.forEach(m => scene.remove(m));
+        gaussianClouds = createGaussianCloud(v);
+        gaussianClouds.forEach(m => scene.add(m));
+        applyVis();
     });
     gsplatFolder.add(params, 'gaussianCount', 100, 1000, 50).name('Gaussian Count').onChange(() => {
-        scene.remove(gaussianCloud);
-        gaussianCloud = createGaussianCloud(params.type);
-        gaussianCloud.visible = params.showGaussians;
-        scene.add(gaussianCloud);
+        gaussianClouds.forEach(m => scene.remove(m));
+        gaussianClouds = createGaussianCloud(params.type);
+        gaussianClouds.forEach(m => scene.add(m));
+        applyVis();
     });
     gsplatFolder.add(params, 'gsplatNoise', 0.0, 1.0, 0.05).name('Splat Noise').onChange(() => {
-        scene.remove(gaussianCloud);
-        gaussianCloud = createGaussianCloud(params.type);
-        gaussianCloud.visible = params.showGaussians;
-        scene.add(gaussianCloud);
+        gaussianClouds.forEach(m => scene.remove(m));
+        gaussianClouds = createGaussianCloud(params.type);
+        gaussianClouds.forEach(m => scene.add(m));
+        applyVis();
     });
 
     // --- TSDF Volume (Step 4 params; mu also governs Step 3 active region) ---
@@ -689,23 +724,22 @@ function setupGUI() {
     ];
     steps.add(params, 'reset').name('Reset Everything');
     window._stepCtrls = stepCtrls;
+    window._setStepButtonsEnabled = (enabled) => stepCtrls.forEach(c => enabled ? c.enable() : c.disable());
 
     const view = gui.addFolder('Visibility');
     view.add(params, 'showGrids').name('Show Grids')
         .onChange(v => { gridHelper.visible = v; });
     const ctrlGaussians = view.add(params, 'showGaussians').name('Show Gaussians')
-        .onChange(v => { gaussianCloud.visible = v; });
+        .onChange(() => applyVis());
     const ctrlCamera = view.add(params, 'showCamera').name('Show Camera')
-        .onChange(v => cameraHelpers.forEach(h => h.visible = v));
+        .onChange(() => applyVis());
     const ctrlPoints = view.add(params, 'showPoints').name('Show Points')
-        .onChange(v => { pointCloud.visible = v; });
+        .onChange(() => applyVis());
     const ctrlVoxels = view.add(params, 'showVoxels').name('Show Voxels')
-        .onChange(v => { voxelCloud.visible = v; });
+        .onChange(() => applyVis());
     const ctrlMesh = view.add(params, 'showMesh').name('Show Mesh')
-        .onChange(v => { marchingCubes.visible = v; marchingWireframe.visible = v; });
+        .onChange(() => applyVis());
 
-    // Expose controllers so triggerStep / worker handlers can update params + GUI in sync
-    window._visCtrl = { ctrlGaussians, ctrlCamera, ctrlPoints, ctrlVoxels, ctrlMesh };
 
     steps.open();
 }
@@ -761,18 +795,39 @@ function initWorker() {
 
             case 'voxels':
                 renderVoxels(data);
+                if (workerResolvers.has('voxels')) {
+                    workerResolvers.get('voxels')(data);
+                    workerResolvers.delete('voxels');
+                }
                 break;
 
             case 'fusing_progress': {
                 const percent = (data.progress * 100).toFixed(0);
                 distancesBuffer = data.distances;
+
+                // Highlight cameras: green = fused, yellow = active, blue = pending
+                if (data.cameraIndex !== undefined) {
+                    cameraHelpers.forEach((h, i) => {
+                        if (h.children[0]) {
+                            const color = i < data.cameraIndex ? 0xa3be8c  // Nord14 green — done
+                                        : i === data.cameraIndex ? 0xebcb8b // Nord13 yellow — active
+                                        : 0x88c0d0;                          // Nord8 blue — pending
+                            h.children[0].material.color.setHex(color);
+                        }
+                    });
+                }
+
                 if (data.isDone) {
+                    // Restore all camera icons to default colour
+                    cameraHelpers.forEach(h => {
+                        if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
+                    });
                     stopVoxelIntegration();
                     updateVoxelColors(data.distances);
                     updateStatus(`Step 4 Complete: TSDF field integrated in ${data.time.toFixed(2)}ms. Run Step 5 to extract the mesh.`);
                 } else {
                     updateVoxelIntegration(data.progress);
-                    updateStatus(`Step 4: Integrating TSDF... ${percent}%`);
+                    updateStatus(`Step 4: Integrating TSDF... camera ${data.cameraIndex + 1} / ${cameraHelpers.length} (${percent}%)`);
                 }
                 break;
             }
@@ -780,33 +835,55 @@ function initWorker() {
             case 'extracted': {
                 distancesBuffer = data;
                 renderMesh(data);
-                const c = window._visCtrl;
-                setVis(c.ctrlGaussians, false);
-                setVis(c.ctrlPoints, false);
-                setVis(c.ctrlVoxels, false);
-                setVis(c.ctrlMesh, true);
+                setVis('gaussians', false);
+                setVis('points', false);
+                setVis('voxels', false);
+                setVis('mesh', true);
                 updateStatus('Step 5 Complete: Mesh Extracted via Marching Cubes.');
                 break;
             }
+
+            case 'play_ready':
+                if (workerResolvers.has('play_ready')) {
+                    workerResolvers.get('play_ready')(data);
+                    workerResolvers.delete('play_ready');
+                }
+                break;
+
+            case 'play_render_done':
+                if (workerResolvers.has('play_render_done')) {
+                    workerResolvers.get('play_render_done')(data);
+                    workerResolvers.delete('play_render_done');
+                }
+                break;
+
+            case 'play_fuse_done':
+                distancesBuffer = data.distances;
+                updateVoxelColors(data.distances);
+                if (workerResolvers.has('play_fuse_done')) {
+                    workerResolvers.get('play_fuse_done')(data);
+                    workerResolvers.delete('play_fuse_done');
+                }
+                break;
 
             case 'reset_done': {
                 currentStep = 0;
                 pendingPoints = null;
                 distancesBuffer = null;
+                accumulatedPointPositions = null;
                 stopPointReveal({ showAll: false });
                 stopVoxelReveal({ showAll: false });
                 stopVoxelIntegration();
                 highlightStep(0); // clears all highlights
                 clearScanRays();
-                scene.remove(gaussianCloud);
-                gaussianCloud = createGaussianCloud(params.type);
-                scene.add(gaussianCloud);
-                const rc = window._visCtrl;
-                setVis(rc.ctrlGaussians, true);
-                setVis(rc.ctrlCamera, false);
-                setVis(rc.ctrlPoints, false);
-                setVis(rc.ctrlVoxels, false);
-                setVis(rc.ctrlMesh, false);
+                gaussianClouds.forEach(m => scene.remove(m));
+                gaussianClouds = createGaussianCloud(params.type);
+                gaussianClouds.forEach(m => scene.add(m));
+                setVis('gaussians', true);
+                setVis('camera', false);
+                setVis('points', false);
+                setVis('voxels', false);
+                setVis('mesh', false);
                 cameraHelpers.forEach(h => {
                     if (h.depthCtx) {
                         h.depthCtx.fillStyle = '#0d1117';
@@ -815,6 +892,12 @@ function initWorker() {
                     }
                 });
                 updateStatus('Reset Complete. Ready for Step 1.');
+                // Abort any in-progress auto-play
+                autoPlayState.playing = false;
+                autoPlayState.paused = false;
+                if (resumeResolve) { resumeResolve(); resumeResolve = null; }
+                updatePlayButton();
+                window._setStepButtonsEnabled?.(true);
                 break;
             }
         }
@@ -822,9 +905,31 @@ function initWorker() {
 }
 
 
-/** Update a visibility toggle param + its GUI controller, which fires onChange. */
-function setVis(ctrl, value) {
-    ctrl.setValue(value);
+/**
+ * Apply visibility: actual = user toggle (params.showX) AND step wants.
+ * Called whenever either side changes.
+ */
+function applyVis() {
+    gaussianClouds.forEach((m, i) => {
+        const g = stepWants.gaussians;
+        const show = g === 'all' || (Array.isArray(g) ? g.includes(i) : g === i);
+        m.visible = params.showGaussians && show;
+    });
+    pointCloud.visible = params.showPoints && stepWants.points;
+    voxelCloud.visible = params.showVoxels && stepWants.voxels;
+    marchingCubes.visible = params.showMesh && stepWants.mesh;
+    marchingWireframe.visible = params.showMesh && stepWants.mesh;
+    cameraHelpers.forEach(h => { h.visible = params.showCamera && stepWants.camera; });
+}
+
+/** Set what the current step wants to show, then reapply. key matches stepWants fields. */
+function setVis(key, value) {
+    if (key === 'gaussians') {
+        stepWants.gaussians = value ? 'all' : -1;
+    } else {
+        stepWants[key] = value;
+    }
+    applyVis();
 }
 
 function highlightStep(step) {
@@ -834,17 +939,15 @@ function highlightStep(step) {
 }
 
 function triggerStep(step) {
-    const { ctrlGaussians, ctrlCamera, ctrlPoints, ctrlVoxels, ctrlMesh } = window._visCtrl;
-
     if (step === 1) {
         currentStep = 1;
         highlightStep(1);
         clearScanRays();
-        setVis(ctrlGaussians, true);
-        setVis(ctrlCamera, true);
-        setVis(ctrlPoints, false);
-        setVis(ctrlVoxels, false);
-        setVis(ctrlMesh, false);
+        setVis('gaussians', true);
+        setVis('camera', true);
+        setVis('points', false);
+        setVis('voxels', false);
+        setVis('mesh', false);
         sendInitToWorker();
         worker.postMessage({ type: 'step1_render' });
 
@@ -854,11 +957,11 @@ function triggerStep(step) {
         currentStep = 2;
         highlightStep(2);
         clearScanRays();
-        setVis(ctrlGaussians, false);
-        setVis(ctrlCamera, false);
-        setVis(ctrlPoints, true);
-        setVis(ctrlVoxels, false);
-        setVis(ctrlMesh, false);
+        setVis('gaussians', false);
+        setVis('camera', false);
+        setVis('points', true);
+        setVis('voxels', false);
+        setVis('mesh', false);
         renderPoints(pendingPoints);
         updateStatus('Step 2: Reconstructing point cloud...');
 
@@ -867,11 +970,11 @@ function triggerStep(step) {
         currentStep = 3;
         highlightStep(3);
         updateStatus('Step 3: Marking active TSDF voxels...');
-        setVis(ctrlGaussians, false);
-        setVis(ctrlCamera, false);
-        setVis(ctrlPoints, true);
-        setVis(ctrlVoxels, true);
-        setVis(ctrlMesh, false);
+        setVis('gaussians', false);
+        setVis('camera', false);
+        setVis('points', true);
+        setVis('voxels', true);
+        setVis('mesh', false);
         worker.postMessage({
             type: 'step3_voxelize',
             data: { resolution: params.resolution, mu: getMu() },
@@ -883,11 +986,11 @@ function triggerStep(step) {
         highlightStep(4);
         stopVoxelReveal();
         updateStatus('Step 4: Integrating TSDF...');
-        setVis(ctrlGaussians, false);
-        setVis(ctrlCamera, false);
-        setVis(ctrlPoints, false);
-        setVis(ctrlVoxels, true);
-        setVis(ctrlMesh, false);
+        setVis('gaussians', false);
+        setVis('camera', true);
+        setVis('points', false);
+        setVis('voxels', true);
+        setVis('mesh', false);
         worker.postMessage({
             type: 'step4_fuse',
             data: {
@@ -906,22 +1009,36 @@ function triggerStep(step) {
 }
 
 function renderPoints(data) {
-    const numPoints = data.length / 7;
-    const positions = new Float32Array(numPoints * 3);
-    for (let i = 0; i < numPoints; i++) {
-        positions[i * 3] = data[i * 7];
-        positions[i * 3 + 1] = data[i * 7 + 1];
-        positions[i * 3 + 2] = data[i * 7 + 2];
+    const newCount = data.length / 7;
+    const newPositions = new Float32Array(newCount * 3);
+    for (let i = 0; i < newCount; i++) {
+        newPositions[i * 3]     = data[i * 7];
+        newPositions[i * 3 + 1] = data[i * 7 + 1];
+        newPositions[i * 3 + 2] = data[i * 7 + 2];
     }
+
+    // In auto-play, prepend accumulated positions from previous cameras
+    const prevCount = accumulatedPointPositions ? accumulatedPointPositions.length / 3 : 0;
+    let positions;
+    if (prevCount > 0) {
+        positions = new Float32Array(prevCount * 3 + newCount * 3);
+        positions.set(accumulatedPointPositions, 0);
+        positions.set(newPositions, prevCount * 3);
+    } else {
+        positions = newPositions;
+    }
+
     pointCloud.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    pointCloud.geometry.setDrawRange(0, 0);
-    pointCloud.material.opacity = 0.18;
-    pointCloud.material.size = 0.028;
+    // Show accumulated portion instantly; new points animate in
+    pointCloud.geometry.setDrawRange(0, prevCount);
+    pointCloud.material.opacity = prevCount > 0 ? 0.8 : 0.18;
+    pointCloud.material.size = prevCount > 0 ? 0.02 : 0.028;
+
     pointRevealState.active = true;
     pointRevealState.startTime = performance.now();
-    pointRevealState.totalPoints = numPoints;
-    pointRevealState.currentCount = 0;
-    pointCloud.visible = params.showPoints;
+    pointRevealState.totalPoints = prevCount + newCount;
+    pointRevealState.prevCount = prevCount;
+    pointRevealState.currentCount = prevCount;
 }
 
 function renderVoxels(data) {
@@ -937,7 +1054,6 @@ function renderVoxels(data) {
     voxelRevealState.startTime = performance.now();
     voxelRevealState.totalPoints = data.length / 3;
     voxelRevealState.currentCount = 0;
-    voxelCloud.visible = params.showVoxels;
     stopVoxelIntegration();
 }
 
@@ -950,6 +1066,149 @@ function renderMesh(distances) {
 
 function resetDemo() {
     worker.postMessage({ type: 'reset' });
+}
+
+/** Show only sector c's gaussian mesh; hide all others. c = -1 hides all. */
+function showSector(c) {
+    stepWants.gaussians = c;
+    applyVis();
+}
+
+/** Add sector c to the currently visible set (cumulative — previous sectors stay). */
+function addSector(c) {
+    const g = stepWants.gaussians;
+    if (g === 'all') return;
+    if (g === -1) {
+        stepWants.gaussians = [c];
+    } else if (Array.isArray(g)) {
+        if (!g.includes(c)) g.push(c);
+    } else {
+        stepWants.gaussians = g === c ? [c] : [g, c];
+    }
+    applyVis();
+}
+
+/** Returns a Promise that resolves once a specific worker message type arrives. */
+function waitForWorkerMsg(type) {
+    return new Promise(resolve => workerResolvers.set(type, resolve));
+}
+
+/** If paused, waits until resume is clicked. */
+function checkPause() {
+    if (!autoPlayState.paused) return Promise.resolve();
+    return new Promise(r => { resumeResolve = r; });
+}
+
+/** Wait until at least `ms` milliseconds have elapsed since `startTime`. */
+function waitAtLeast(ms, startTime = performance.now()) {
+    const remaining = ms - (performance.now() - startTime);
+    return new Promise(r => setTimeout(r, Math.max(0, remaining)));
+}
+
+function updatePlayButton() {
+    const ctrl = window._playPauseCtrl;
+    if (!ctrl) return;
+    if (!autoPlayState.playing) ctrl.name('▶ Auto Play');
+    else if (autoPlayState.paused) ctrl.name('▶ Resume');
+    else ctrl.name('⏸ Pause');
+}
+
+function togglePause() {
+    if (!autoPlayState.playing) return;
+    autoPlayState.paused = !autoPlayState.paused;
+    if (!autoPlayState.paused && resumeResolve) {
+        resumeResolve();
+        resumeResolve = null;
+    }
+    updatePlayButton();
+}
+
+async function startAutoPlay() {
+    if (autoPlayState.playing) return;
+    autoPlayState.playing = true;
+    autoPlayState.paused = false;
+    updatePlayButton();
+    window._setStepButtonsEnabled?.(false);
+
+    accumulatedPointPositions = null;
+
+    // Reset visuals
+    setVis('gaussians', false);
+    setVis('camera', false);
+    setVis('points', false);
+    setVis('voxels', false);
+    setVis('mesh', false);
+    clearScanRays();
+    currentStep = 0;
+    highlightStep(0);
+
+    // Init worker: reset volume + build per-camera point clouds
+    updateStatus('Auto Play: Initialising...');
+    sendInitToWorker();
+    worker.postMessage({ type: 'play_init' });
+    const cameraPointsData = await waitForWorkerMsg('play_ready');
+
+    // Pre-populate voxel cloud so SDF colours can update progressively (keep hidden until fuse step)
+    worker.postMessage({ type: 'step3_voxelize', data: { resolution: params.resolution, mu: getMu() } });
+    await waitForWorkerMsg('voxels');
+
+    for (let c = 0; c < CAM_COUNT_MAIN; c++) {
+        if (!autoPlayState.playing) break;
+
+        // ── Step 1: sector gaussian + depth map ──────────────────────────────
+        highlightStep(1);
+        updateStatus(`Camera ${c + 1}/8 — Step 1: Rendering depth map...`);
+        addSector(c);
+        setVis('camera', true);
+        cameraHelpers.forEach((h, i) => {
+            if (h.children[0]) h.children[0].material.color.setHex(i === c ? 0xebcb8b : 0x88c0d0);
+        });
+        const t1 = performance.now();
+        worker.postMessage({ type: 'play_render', data: { cameraIndex: c } });
+        await waitForWorkerMsg('play_render_done');
+        await waitAtLeast(3000, t1);
+        await checkPause();
+
+        // ── Step 2: point cloud ───────────────────────────────────────────────
+        highlightStep(2);
+        updateStatus(`Camera ${c + 1}/8 — Step 2: Point cloud`);
+        renderPoints(cameraPointsData[c]);
+        setVis('points', true);
+        await waitAtLeast(3000);
+        await checkPause();
+
+        // Accumulate this camera's points for the next camera's display
+        accumulatedPointPositions = pointCloud.geometry.attributes.position.array.slice();
+
+        // ── Step 3: fuse ──────────────────────────────────────────────────────
+        highlightStep(3);
+        updateStatus(`Camera ${c + 1}/8 — Step 3: Fusing into TSDF volume...`);
+        setVis('voxels', true);
+        voxelIntegrationState.active = true;
+        const t3 = performance.now();
+        worker.postMessage({ type: 'play_fuse', data: { cameraIndex: c } });
+        await waitForWorkerMsg('play_fuse_done');
+        stopVoxelIntegration();
+        await waitAtLeast(3000, t3);
+        await checkPause();
+
+        setVis('voxels', false); // hide voxels after fuse step
+        cameraHelpers.forEach(h => {
+            if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
+        });
+    }
+
+    if (autoPlayState.playing) {
+        // Extract mesh
+        highlightStep(5);
+        updateStatus('All cameras fused. Extracting mesh...');
+        worker.postMessage({ type: 'step5_extract' });
+        // extracted handler will show the mesh
+    }
+
+    autoPlayState.playing = false;
+    updatePlayButton();
+    window._setStepButtonsEnabled?.(true);
 }
 
 function sendInitToWorker() {
@@ -966,7 +1225,7 @@ function sendInitToWorker() {
             outliers: params.outliers,
             // Pass gaussian positions so the worker can build a point cloud that
             // reflects the gsplat distribution (artifacts included).
-            gaussianPoints: gaussianCloud?.rawPoints?.slice() ?? null,
+            gaussianPoints: getGaussianRawPoints(),
         },
     });
 }
@@ -1002,15 +1261,23 @@ function animate() {
         const elapsed = performance.now() - pointRevealState.startTime;
         const t = Math.min(1, elapsed / pointRevealState.durationMs);
         const eased = easeOutCubic(t);
-        const nextCount = Math.floor(pointRevealState.totalPoints * eased);
+        const prev = pointRevealState.prevCount;
+        const newTotal = pointRevealState.totalPoints - prev;
+        const nextCount = prev + Math.floor(newTotal * eased);
 
         if (nextCount !== pointRevealState.currentCount) {
             pointCloud.geometry.setDrawRange(0, nextCount);
             pointRevealState.currentCount = nextCount;
         }
 
-        pointCloud.material.opacity = 0.18 + eased * 0.62;
-        pointCloud.material.size = 0.028 - eased * 0.008;
+        if (prev > 0) {
+            // Accumulated points already at full opacity; just reveal new ones via draw range
+            pointCloud.material.opacity = 0.8;
+            pointCloud.material.size = 0.02;
+        } else {
+            pointCloud.material.opacity = 0.18 + eased * 0.62;
+            pointCloud.material.size = 0.028 - eased * 0.008;
+        }
 
         if (t >= 1) {
             stopPointReveal();

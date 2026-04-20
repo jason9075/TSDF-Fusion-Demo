@@ -7,6 +7,7 @@ let noiseStd = 0.02;
 let outlierRate = 0.05;
 let observationWeight = 1.0;
 let gaussianPoints = null; // Float32Array [x,y,z,nx,ny,nz] × N from main thread
+let cameraPoints = null;  // Array<Float32Array> — per-camera point sub-clouds for incremental fusion
 
 /** Must match the constants in main.js */
 const CAM_COUNT = 8;
@@ -55,7 +56,7 @@ self.onmessage = (e) => {
             break;
 
         case 'step4_fuse':
-            if (volume && currentPoints) {
+            if (volume && cameraPoints) {
                 // Apply latest params so re-running step 4 after changing mu/weights
                 // always reflects the current GUI settings.
                 if (data) {
@@ -70,7 +71,7 @@ self.onmessage = (e) => {
                 // runs accumulate weights and changing params has no visible effect.
                 volume.distances.fill(1.0);
                 volume.weights.fill(0.0);
-                fuseProgressive(volume, currentPoints);
+                fusePerCamera(volume, cameraPoints);
             }
             break;
 
@@ -80,12 +81,47 @@ self.onmessage = (e) => {
             }
             break;
 
+        case 'play_init':
+            // Reset volume and build per-camera point clouds — volume is NOT reset again
+            // between cameras so each camera accumulates into the same field.
+            if (volume) {
+                volume.distances.fill(1.0);
+                volume.weights.fill(0.0);
+            }
+            cameraPoints = gaussianPoints
+                ? sampleCameraPointsFromGaussians()
+                : sampleCameraPointsFromSurface();
+            {
+                const totalLen = cameraPoints.reduce((s, cp) => s + cp.length, 0);
+                currentPoints = new Float32Array(totalLen);
+                let off = 0;
+                for (const cp of cameraPoints) { currentPoints.set(cp, off); off += cp.length; }
+            }
+            self.postMessage({ type: 'play_ready', data: cameraPoints });
+            break;
+
+        case 'play_render':
+            playRenderCamera(data.cameraIndex);
+            break;
+
+        case 'play_fuse':
+            if (volume && cameraPoints && cameraPoints[data.cameraIndex]) {
+                const pts = cameraPoints[data.cameraIndex];
+                if (pts.length > 0) volume.fuse(pts);
+            }
+            self.postMessage({
+                type: 'play_fuse_done',
+                data: { cameraIndex: data.cameraIndex, distances: volume.getGridData() },
+            });
+            break;
+
         case 'reset':
             if (volume) {
                 volume.distances.fill(1.0);
                 volume.weights.fill(0.0);
             }
             currentPoints = null;
+            cameraPoints = null;
             gaussianPoints = null;
             self.postMessage({ type: 'reset_done' });
             break;
@@ -153,45 +189,69 @@ async function renderDepthMapsProgressive() {
         await new Promise(r => setTimeout(r, 60));
     }
 
-    // Build the point cloud to match the gsplat visual distribution.
-    currentPoints = gaussianPoints
-        ? samplePointCloudFromGaussians()
-        : samplePointCloudFromSurface();
+    // Build per-camera point sub-clouds for incremental fusion (Step 4).
+    cameraPoints = gaussianPoints
+        ? sampleCameraPointsFromGaussians()
+        : sampleCameraPointsFromSurface();
+
+    // Merge all sub-clouds into one flat array for Step 3 voxelization and Step 2 display.
+    const totalLen = cameraPoints.reduce((s, cp) => s + cp.length, 0);
+    currentPoints = new Float32Array(totalLen);
+    let mergeOffset = 0;
+    for (const cp of cameraPoints) {
+        currentPoints.set(cp, mergeOffset);
+        mergeOffset += cp.length;
+    }
 
     self.postMessage({ type: 'points', data: currentPoints });
 }
 
 /**
- * Build a point cloud directly from gaussian positions (1:1, no noise added).
- * Artifact positions (floaters, needles, blobs) are already baked into gaussianPoints
- * by createGaussianCloud() in main.js, so the distribution mirrors the visual splat.
+ * Map a 3D point's XZ angle to the camera sector index that best faces it.
+ * Camera c is at angle (c/CAM_COUNT)*2π and looks toward the opposite side (+ π).
+ * A point at XZ angle θ is best seen by camera c where c = floor(((θ+π) % 2π) / sectorSize).
  */
-function samplePointCloudFromGaussians() {
-    const N = gaussianPoints.length / 6; // [x,y,z,nx,ny,nz] per entry
-    const points = new Float32Array(N * 7);
-    for (let i = 0; i < N; i++) {
-        points[i * 7]     = gaussianPoints[i * 6];
-        points[i * 7 + 1] = gaussianPoints[i * 6 + 1];
-        points[i * 7 + 2] = gaussianPoints[i * 6 + 2];
-        points[i * 7 + 3] = gaussianPoints[i * 6 + 3];
-        points[i * 7 + 4] = gaussianPoints[i * 6 + 4];
-        points[i * 7 + 5] = gaussianPoints[i * 6 + 5];
-        points[i * 7 + 6] = observationWeight;
-    }
-    return points;
+function getAngleSector(px, pz) {
+    const normalizedAngle = ((Math.atan2(pz, px) + Math.PI * 2) % (Math.PI * 2));
+    const sectorSize = (Math.PI * 2) / CAM_COUNT;
+    return Math.floor(normalizedAngle / sectorSize);
 }
 
 /**
- * Fallback: build point cloud by back-projecting depth map hits against the
- * analytical surface. Used when no gaussian data is available.
+ * Assign each gaussian to the camera sector based on XZ angle.
+ * Returns one Float32Array per camera.
+ * Artifact positions are already baked into gaussianPoints by createGaussianCloud().
  */
-function samplePointCloudFromSurface() {
+function sampleCameraPointsFromGaussians() {
+    const N = gaussianPoints.length / 6;
+    const perCamera = Array.from({ length: CAM_COUNT }, () => []);
+
+    for (let i = 0; i < N; i++) {
+        const px = gaussianPoints[i * 6];
+        const py = gaussianPoints[i * 6 + 1];
+        const pz = gaussianPoints[i * 6 + 2];
+        const nx = gaussianPoints[i * 6 + 3];
+        const ny = gaussianPoints[i * 6 + 4];
+        const nz = gaussianPoints[i * 6 + 5];
+        const c = getAngleSector(px, pz);
+        perCamera[c].push(px, py, pz, nx, ny, nz, observationWeight);
+    }
+
+    return perCamera.map(arr => new Float32Array(arr));
+}
+
+/**
+ * Fallback: back-project depth map hits per camera. Each camera yields its own
+ * Float32Array. Outliers are distributed randomly across cameras.
+ */
+function sampleCameraPointsFromSurface() {
     const halfFOV = (CAM_FOV_DEG * Math.PI / 180) / 2;
     const tanFOV  = Math.tan(halfFOV);
-    const allPoints = [];
+    const perCamera = [];
 
     for (let camIdx = 0; camIdx < CAM_COUNT; camIdx++) {
         const { pos, fwd, right, up } = getCameraAxes(camIdx);
+        const camPoints = [];
         for (let py = 0; py < DEPTH_RES; py++) {
             for (let px = 0; px < DEPTH_RES; px++) {
                 const ndcX = (px + 0.5) / DEPTH_RES * 2 - 1;
@@ -217,7 +277,7 @@ function samplePointCloudFromSurface() {
                     nx = gx / gLen; ny = gy / gLen; nz = gz / gLen;
                 }
                 if (nx * (-dir[0]) + ny * (-dir[1]) + nz * (-dir[2]) < 0) { nx = -nx; ny = -ny; nz = -nz; }
-                allPoints.push(
+                camPoints.push(
                     hx + gaussianRandom() * noiseStd,
                     hy + gaussianRandom() * noiseStd,
                     hz + gaussianRandom() * noiseStd,
@@ -225,16 +285,21 @@ function samplePointCloudFromSurface() {
                 );
             }
         }
+        perCamera.push(camPoints);
     }
 
-    const numOutliers = Math.floor(allPoints.length / 7 * outlierRate);
+    // Distribute outliers randomly across cameras.
+    const totalPoints = perCamera.reduce((s, cp) => s + cp.length / 7, 0);
+    const numOutliers = Math.floor(totalPoints * outlierRate);
     for (let i = 0; i < numOutliers; i++) {
+        const targetCam = Math.floor(Math.random() * CAM_COUNT);
         const ox = (Math.random() - 0.5) * 4, oy = (Math.random() - 0.5) * 4, oz = (Math.random() - 0.5) * 4;
         let onx = Math.random() - 0.5, ony = Math.random() - 0.5, onz = Math.random() - 0.5;
         const onLen = Math.sqrt(onx ** 2 + ony ** 2 + onz ** 2);
-        allPoints.push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, observationWeight);
+        perCamera[targetCam].push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, observationWeight);
     }
-    return new Float32Array(allPoints);
+
+    return perCamera.map(arr => new Float32Array(arr));
 }
 
 // ---------------------------------------------------------------------------
@@ -327,34 +392,62 @@ function getAffectedVoxels(vol, points) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 4: Progressive TSDF fusion
+// Step 4: Incremental per-camera TSDF fusion
 // ---------------------------------------------------------------------------
 
-async function fuseProgressive(vol, points) {
-    const numPoints = points.length / 7;
-    const chunkSize = 500;
-    const reportEvery = 2;
-    const startTime = performance.now();
-    let chunkIndex = 0;
+/**
+ * Render the depth map for a single camera and report progress.
+ * Used by auto-play mode so each camera's render is animated independently.
+ */
+async function playRenderCamera(camIdx) {
+    const halfFOV = (CAM_FOV_DEG * Math.PI / 180) / 2;
+    const tanFOV = Math.tan(halfFOV);
+    const { pos, fwd, right, up } = getCameraAxes(camIdx);
+    const depthMap = new Float32Array(DEPTH_RES * DEPTH_RES).fill(-1);
 
-    for (let i = 0; i < numPoints; i += chunkSize) {
-        const end = Math.min(i + chunkSize, numPoints);
-        vol.fuse(points.subarray(i * 7, end * 7));
-        chunkIndex++;
-
-        const isDone = end === numPoints;
-        if (isDone || chunkIndex % reportEvery === 0) {
-            self.postMessage({
-                type: 'fusing_progress',
-                data: {
-                    distances: vol.getGridData(),
-                    progress: end / numPoints,
-                    isDone,
-                    time: performance.now() - startTime,
-                },
-            });
+    for (let py = 0; py < DEPTH_RES; py++) {
+        for (let px = 0; px < DEPTH_RES; px++) {
+            const ndcX = (px + 0.5) / DEPTH_RES * 2 - 1;
+            const ndcY = 1 - (py + 0.5) / DEPTH_RES * 2;
+            const rdx = fwd[0] + ndcX * tanFOV * right[0] + ndcY * tanFOV * up[0];
+            const rdy = fwd[1] + ndcX * tanFOV * right[1] + ndcY * tanFOV * up[1];
+            const rdz = fwd[2] + ndcX * tanFOV * right[2] + ndcY * tanFOV * up[2];
+            const rdLen = Math.sqrt(rdx ** 2 + rdy ** 2 + rdz ** 2);
+            const dir = [rdx / rdLen, rdy / rdLen, rdz / rdLen];
+            const t = sceneType === 'sphere' ? raySphere(pos, dir) : rayTorus(pos, dir);
+            if (t >= 0) depthMap[py * DEPTH_RES + px] = t;
         }
+    }
 
-        await new Promise(r => setTimeout(r, 80));
+    self.postMessage({ type: 'depth_progress', data: { camIndex: camIdx, depthMap } });
+    await new Promise(r => setTimeout(r, 30));
+    self.postMessage({ type: 'play_render_done', data: { cameraIndex: camIdx } });
+}
+
+/**
+ * Fuse one camera at a time so the UI can animate which camera is contributing.
+ * Each iteration posts a fusing_progress message with the current camera index.
+ */
+async function fusePerCamera(vol, camPointArrays) {
+    const total = camPointArrays.length;
+    const startTime = performance.now();
+
+    for (let c = 0; c < total; c++) {
+        const pts = camPointArrays[c];
+        if (pts && pts.length > 0) vol.fuse(pts);
+
+        const isDone = c === total - 1;
+        self.postMessage({
+            type: 'fusing_progress',
+            data: {
+                distances: vol.getGridData(),
+                progress: (c + 1) / total,
+                isDone,
+                time: performance.now() - startTime,
+                cameraIndex: c,
+            },
+        });
+
+        if (!isDone) await new Promise(r => setTimeout(r, 300));
     }
 }
