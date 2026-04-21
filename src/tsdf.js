@@ -42,11 +42,6 @@ export class TSDFVolume {
         return next;
     }
 
-    copyFrom(other) {
-        this.distances.set(other.distances);
-        this.weights.set(other.weights);
-    }
-
     /**
      * Map world coordinates [x, y, z] to voxel index
      */
@@ -179,14 +174,4 @@ export class TSDFVolume {
         }
     }
 
-    getState() {
-        return {
-            distances: this.distances,
-            weights: this.weights,
-        };
-    }
-
-    getGridData() {
-        return this.distances;
-    }
 }

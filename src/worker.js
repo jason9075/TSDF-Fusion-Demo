@@ -1,4 +1,5 @@
 import { TSDFVolume } from './tsdf.js';
+import { DEPTH_RES } from './constants.js';
 
 let frameVolume = null;
 let globalVolume = null;
@@ -21,7 +22,6 @@ const CAM_COUNT = 8;
 const CAM_RADIUS = 2.5;
 const CAM_HEIGHT = 1.0;
 const CAM_FOV_DEG = 45;
-export const DEPTH_RES = 48;
 
 self.onmessage = (e) => {
     const { type, data } = e.data;

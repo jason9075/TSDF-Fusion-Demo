@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { MarchingCubes } from 'three/addons/objects/MarchingCubes.js';
 import GUI from 'lil-gui';
+import { DEPTH_RES } from './constants.js';
 
 /**
  * TSDF Demo - Step-by-Step Educational Version
@@ -59,9 +60,6 @@ const stepWants = { gaussians: 'all', points: true, frameVoxels: false, globalVo
 const visibilityControllers = {};
 let observationProgressCtrl = null;
 
-// Accumulated point positions from all previously completed cameras (auto-play only)
-let accumulatedPointPositions = null;
-
 let worker;
 let workerNeedsInit = true;
 let currentStep = 0;
@@ -90,7 +88,7 @@ const pointRevealState = {
     durationMs: POINT_REVEAL_DURATION_MS,
     totalPoints: 0,
     currentCount: 0,
-    prevCount: 0, // static portion from accumulated cameras (auto-play)
+    prevCount: 0,
 };
 const voxelRevealState = {
     active: false,
@@ -111,7 +109,6 @@ const stepProgressState = {
     completedStep: 0,
 };
 
-const DEPTH_RES = 48; // must match worker.js
 
 /**
  * Build 8 sector meshes representing the 3DGS scene, one per camera viewing angle.
@@ -944,7 +941,6 @@ function initWorker() {
 
             case 'reset_done': {
                 resetManualProgress();
-                accumulatedPointPositions = null;
                 globalDistancesBuffer = null;
                 globalWeightsBuffer = null;
                 distancesBuffer = null;
@@ -1474,36 +1470,25 @@ function triggerStep(step) {
     }
 }
 
-function renderPoints(data, { accumulate = false } = {}) {
+function renderPoints(data) {
     const newCount = data.length / 7;
-    const newPositions = new Float32Array(newCount * 3);
+    const positions = new Float32Array(newCount * 3);
     for (let i = 0; i < newCount; i++) {
-        newPositions[i * 3]     = data[i * 7];
-        newPositions[i * 3 + 1] = data[i * 7 + 1];
-        newPositions[i * 3 + 2] = data[i * 7 + 2];
-    }
-
-    const prevCount = accumulate && accumulatedPointPositions ? accumulatedPointPositions.length / 3 : 0;
-    let positions;
-    if (prevCount > 0) {
-        positions = new Float32Array(prevCount * 3 + newCount * 3);
-        positions.set(accumulatedPointPositions, 0);
-        positions.set(newPositions, prevCount * 3);
-    } else {
-        positions = newPositions;
+        positions[i * 3]     = data[i * 7];
+        positions[i * 3 + 1] = data[i * 7 + 1];
+        positions[i * 3 + 2] = data[i * 7 + 2];
     }
 
     pointCloud.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    // Show accumulated portion instantly; new points animate in
-    pointCloud.geometry.setDrawRange(0, prevCount);
-    pointCloud.material.opacity = prevCount > 0 ? 0.8 : 0.18;
-    pointCloud.material.size = prevCount > 0 ? 0.02 : 0.028;
+    pointCloud.geometry.setDrawRange(0, 0);
+    pointCloud.material.opacity = 0.18;
+    pointCloud.material.size = 0.028;
 
     pointRevealState.active = true;
     pointRevealState.startTime = performance.now();
-    pointRevealState.totalPoints = prevCount + newCount;
-    pointRevealState.prevCount = prevCount;
-    pointRevealState.currentCount = prevCount;
+    pointRevealState.totalPoints = newCount;
+    pointRevealState.prevCount = 0;
+    pointRevealState.currentCount = 0;
 }
 
 function renderVoxels(targetCloud, data, { animate = true } = {}) {
@@ -1629,8 +1614,6 @@ async function startAutoPlay() {
     autoPlayState.paused = false;
     updatePlayButton();
 
-    accumulatedPointPositions = null;
-
     // Reset visuals
     setManualVisibilityState({
         showGaussians: false,
@@ -1701,7 +1684,7 @@ async function startAutoPlay() {
             showGlobalVoxels: false,
             showMesh: false,
         });
-        renderPoints(pendingPoints, { accumulate: false });
+        renderPoints(pendingPoints);
         worker.postMessage({
             type: 'generate_tsdf',
             data: {
@@ -1717,8 +1700,6 @@ async function startAutoPlay() {
         await checkPause();
         await waitWithStepProgress(2, AUTO_PLAY_STEP_HOLD_MS, performance.now(), { nextStep: 3 });
         if (!autoPlayState.playing) break;
-
-        accumulatedPointPositions = null;
 
         if (observationIndex === 0) {
             markStepComplete(3, { nextStep: 4 });
