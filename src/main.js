@@ -20,10 +20,11 @@ const params = {
     showPoints: true,
     showVoxels: true,
     showMesh: true,
-    showCamera: false,
+    showCamera: true,
     showGrids: true,
     showKnowledge: () => toggleModal(true),
     cameraZoom: 5.2, // initial distance = length of (3,3,3)
+    currentCamera: 1,
     type: 'sphere',
 
     // Step Buttons
@@ -31,7 +32,6 @@ const params = {
     step2: () => triggerStep(2),
     step3: () => triggerStep(3),
     step4: () => triggerStep(4),
-    step5: () => triggerStep(5),
     reset: () => resetDemo(),
 };
 
@@ -49,18 +49,25 @@ const workerResolvers = new Map(); // type → resolve, for async worker communi
 
 // What the current step/play WANTS to show — independent of user toggle permissions.
 // gaussians: -1 = hide all, 'all' = show all sectors, 0–7 = show specific sector
-const stepWants = { gaussians: 'all', points: false, voxels: false, mesh: false, camera: false };
+const stepWants = { gaussians: 'all', points: true, voxels: false, mesh: false, camera: true };
+const visibilityControllers = {};
 
 // Accumulated point positions from all previously completed cameras (auto-play only)
 let accumulatedPointPositions = null;
 
 let worker;
+let workerNeedsInit = true;
 let currentStep = 0;
 let distancesBuffer = null;
-let pendingPoints = null; // point cloud from step 1, shown in step 2
+let pendingPoints = null;
+let activeDepthMap = null;
+let activeCameraIndex = 0;
+let frameDistancesBuffer = null;
+let globalDistancesBuffer = null;
 
 const POINT_REVEAL_DURATION_MS = 1100;
 const VOXEL_REVEAL_DURATION_MS = 850;
+const AUTO_PLAY_STEP_HOLD_MS = 5000;
 const pointRevealState = {
     active: false,
     startTime: 0,
@@ -80,6 +87,12 @@ const voxelIntegrationState = {
     active: false,
     progress: 0,
     pulsePhase: 0,
+};
+const stepProgressState = {
+    activeStep: 0,
+    activeProgress: 0,
+    nextStep: 0,
+    completedStep: 0,
 };
 
 const DEPTH_RES = 48; // must match worker.js
@@ -180,7 +193,7 @@ function createGaussianCloud(type, N = params.gaussianCount, noise = params.gspl
             lig = 0.55 + Math.random() * 0.20;
         }
 
-        // Sector assignment — must match worker's getAngleSector formula
+        // Sector assignment — shared with the worker's angular camera partitioning.
         const normalizedAngle = ((Math.atan2(z, x) + Math.PI * 2) % (Math.PI * 2));
         const sectorIdx = Math.floor(normalizedAngle / sectorSize);
 
@@ -220,6 +233,39 @@ function getGaussianRawPoints() {
     let off = 0;
     for (const m of gaussianClouds) { merged.set(m.rawPoints, off); off += m.rawPoints.length; }
     return merged;
+}
+
+function syncPointCloudToGaussians() {
+    renderRawPoints(getGaussianRawPoints());
+    pendingPoints = null;
+    applyVis();
+}
+
+function renderGaussianSectorPoints(cameraIndex) {
+    const rawPoints = gaussianClouds[cameraIndex]?.rawPoints ?? new Float32Array(0);
+    renderRawPoints(rawPoints);
+    pendingPoints = null;
+    applyVis();
+}
+
+function renderRawPoints(rawPoints) {
+    const pointCount = rawPoints.length / 6;
+    const positions = new Float32Array(pointCount * 3);
+
+    for (let i = 0; i < pointCount; i++) {
+        positions[i * 3] = rawPoints[i * 6];
+        positions[i * 3 + 1] = rawPoints[i * 6 + 1];
+        positions[i * 3 + 2] = rawPoints[i * 6 + 2];
+    }
+
+    pointCloud.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    pointCloud.geometry.setDrawRange(0, pointCount);
+    pointCloud.material.opacity = 0.8;
+    pointCloud.material.size = 0.02;
+    pointRevealState.active = false;
+    pointRevealState.totalPoints = pointCount;
+    pointRevealState.currentCount = pointCount;
+    pointRevealState.prevCount = 0;
 }
 
 /**
@@ -454,6 +500,7 @@ function init() {
     pointCloud = new THREE.Points(new THREE.BufferGeometry(), pcMaterial);
     pointCloud.visible = false;
     scene.add(pointCloud);
+    syncPointCloudToGaussians();
 
     // Step 2: Voxelization
     const voxelMaterial = new THREE.PointsMaterial({
@@ -552,13 +599,15 @@ function stopVoxelReveal({ showAll = true } = {}) {
     voxelCloud.material.size = 0.03;
 }
 
-function stopVoxelIntegration() {
+function stopVoxelIntegration({ preserveColors = false } = {}) {
     voxelIntegrationState.active = false;
     voxelIntegrationState.progress = 0;
     voxelIntegrationState.pulsePhase = 0;
-    voxelCloud.material.color.setHex(0xebcb8b);
-    voxelCloud.material.opacity = params.showVoxels ? 0.4 : voxelCloud.material.opacity;
-    voxelCloud.material.size = 0.03;
+    if (!preserveColors) {
+        voxelCloud.material.color.setHex(0xebcb8b);
+        voxelCloud.material.opacity = params.showVoxels ? 0.4 : voxelCloud.material.opacity;
+        voxelCloud.material.size = 0.03;
+    }
 }
 
 /**
@@ -645,6 +694,13 @@ function setupGUI() {
         camera.position.copy(controls.target).add(offset);
         controls.update();
     });
+    gui.add(params, 'currentCamera', 1, CAM_COUNT_MAIN, 1).name('Active Camera').onChange(v => {
+        activeCameraIndex = v - 1;
+        resetManualProgress();
+        updateStepIndicators({ activeStep: 0, activeProgress: 0, nextStep: 1, completedStep: 0 });
+        clearScanRays();
+        highlightCamera(activeCameraIndex);
+    });
     let playPauseCtrl;
     params.togglePlay = () => {
         if (!autoPlayState.playing) startAutoPlay();
@@ -657,6 +713,9 @@ function setupGUI() {
     // because MC reads the TSDF distances array directly (marchingCubes.field.set(distances)).
     params.voxelSizeDisplay = `${(4.0 / params.resolution).toFixed(4)}`;
     gui.add(params, 'resolution', 32, 96, 16).name('Grid Resolution').onChange(() => {
+        workerNeedsInit = true;
+        globalDistancesBuffer = null;
+        resetManualProgress();
         params.voxelSizeDisplay = `${(4.0 / params.resolution).toFixed(4)}`;
         voxelSizeCtrl.updateDisplay();
 
@@ -690,41 +749,57 @@ function setupGUI() {
     // --- Gaussian Splat (affects Step 1) ---
     const gsplatFolder = gui.addFolder('Gaussian Splat (Step 1)');
     gsplatFolder.add(params, 'type', ['sphere', 'torus']).name('Surface Type').onChange(v => {
+        workerNeedsInit = true;
+        globalDistancesBuffer = null;
+        resetManualProgress();
         gaussianClouds.forEach(m => scene.remove(m));
         gaussianClouds = createGaussianCloud(v);
         gaussianClouds.forEach(m => scene.add(m));
+        syncPointCloudToGaussians();
         applyVis();
     });
     gsplatFolder.add(params, 'gaussianCount', 100, 1000, 50).name('Gaussian Count').onChange(() => {
+        workerNeedsInit = true;
+        globalDistancesBuffer = null;
+        resetManualProgress();
         gaussianClouds.forEach(m => scene.remove(m));
         gaussianClouds = createGaussianCloud(params.type);
         gaussianClouds.forEach(m => scene.add(m));
+        syncPointCloudToGaussians();
         applyVis();
     });
     gsplatFolder.add(params, 'gsplatNoise', 0.0, 1.0, 0.05).name('Splat Noise').onChange(() => {
+        workerNeedsInit = true;
+        globalDistancesBuffer = null;
+        resetManualProgress();
         gaussianClouds.forEach(m => scene.remove(m));
         gaussianClouds = createGaussianCloud(params.type);
         gaussianClouds.forEach(m => scene.add(m));
+        syncPointCloudToGaussians();
         applyVis();
     });
 
-    // --- TSDF Volume (Step 4 params; mu also governs Step 3 active region) ---
-    const tsdfFolder = gui.addFolder('TSDF Volume (Steps 3–4)');
+    // --- TSDF Volume (Generate + Fuse params) ---
+    const tsdfFolder = gui.addFolder('TSDF Volume (Steps 2–3)');
     tsdfFolder.add(params, 'muVoxels', 1, 10, 0.5).name('Truncation μ');
     tsdfFolder.add(params, 'observationWeight', 0.1, 4.0, 0.1).name('Observation Weight');
     tsdfFolder.add(params, 'maxTSDFWeight', 1, 128, 1).name('Max TSDF Weight');
 
     const steps = gui.addFolder('Steps');
     const stepCtrls = [
-        steps.add(params, 'step1').name('1. Render Depth Maps'),
-        steps.add(params, 'step2').name('2. Reconstruct Point Cloud'),
-        steps.add(params, 'step3').name('3. Mark Active Voxels'),
-        steps.add(params, 'step4').name('4. Integrate TSDF'),
-        steps.add(params, 'step5').name('5. Extract Mesh (Marching Cubes)'),
+        steps.add(params, 'step1').name('1. Acquire Depth'),
+        steps.add(params, 'step2').name('2. Generate TSDF'),
+        steps.add(params, 'step3').name('3. TSDF Fuse'),
+        steps.add(params, 'step4').name('4. Marching Cubes'),
     ];
     steps.add(params, 'reset').name('Reset Everything');
+    stepCtrls.forEach(ctrl => {
+        ctrl.domElement.classList.add('step-controller');
+        ctrl.domElement.style.setProperty('--step-progress', '0%');
+    });
     window._stepCtrls = stepCtrls;
     window._setStepButtonsEnabled = (enabled) => stepCtrls.forEach(c => enabled ? c.enable() : c.disable());
+    updateStepIndicators({ activeStep: 0, activeProgress: 0, nextStep: 1, completedStep: 0 });
 
     const view = gui.addFolder('Visibility');
     view.add(params, 'showGrids').name('Show Grids')
@@ -739,6 +814,11 @@ function setupGUI() {
         .onChange(() => applyVis());
     const ctrlMesh = view.add(params, 'showMesh').name('Show Mesh')
         .onChange(() => applyVis());
+    visibilityControllers.showGaussians = ctrlGaussians;
+    visibilityControllers.showCamera = ctrlCamera;
+    visibilityControllers.showPoints = ctrlPoints;
+    visibilityControllers.showVoxels = ctrlVoxels;
+    visibilityControllers.showMesh = ctrlMesh;
 
 
     steps.open();
@@ -751,137 +831,88 @@ function initWorker() {
     worker.onmessage = (e) => {
         const { type, data } = e.data;
         switch (type) {
-            case 'ready': updateStatus('System Ready. Start with Step 1.'); break;
+            case 'ready':
+                workerNeedsInit = false;
+                updateStatus('System Ready. Start with Step 1: Acquire Depth.');
+                break;
 
-            // Step 1: one depth map per camera arrives progressively
-            case 'depth_progress': {
-                const { camIndex, depthMap } = data;
-                const icon = cameraHelpers[camIndex];
-                if (!icon?.depthCtx) break;
-
-                const ctx = icon.depthCtx;
-                const imgData = ctx.createImageData(DEPTH_RES, DEPTH_RES);
-                let minD = Infinity, maxD = -Infinity;
-                for (let i = 0; i < depthMap.length; i++) {
-                    if (depthMap[i] >= 0) { minD = Math.min(minD, depthMap[i]); maxD = Math.max(maxD, depthMap[i]); }
-                }
-                for (let i = 0; i < depthMap.length; i++) {
-                    const d = depthMap[i];
-                    const idx = i * 4;
-                    if (d < 0) {
-                        imgData.data[idx] = 13; imgData.data[idx + 1] = 17; imgData.data[idx + 2] = 23; imgData.data[idx + 3] = 200;
-                    } else {
-                        // near = bright, far = dark (standard depth map convention)
-                        const t = maxD > minD ? 1 - (d - minD) / (maxD - minD) : 0.5;
-                        const v = Math.floor(t * 255);
-                        imgData.data[idx] = v; imgData.data[idx + 1] = v; imgData.data[idx + 2] = v; imgData.data[idx + 3] = 255;
-                    }
-                }
-                ctx.putImageData(imgData, 0, 0);
-                icon.depthTexture.needsUpdate = true;
-                createScanRays(camIndex);
-                updateStatus(`Step 1: Rendering depth maps... camera ${camIndex + 1} / ${cameraHelpers.length}`);
+            case 'depth_acquired': {
+                const { cameraIndex, depthMap, points } = data;
+                activeCameraIndex = cameraIndex;
+                params.currentCamera = cameraIndex + 1;
+                activeDepthMap = depthMap;
+                pendingPoints = points;
+                showSingleDepthMap(cameraIndex, depthMap);
+                clearScanRays();
+                createScanRays(cameraIndex);
+                highlightCamera(cameraIndex);
+                markStepComplete(1, { nextStep: 2 });
+                resolveWorker('depth_acquired', data);
+                updateStatus(`Step 1 Complete: Camera ${cameraIndex + 1} depth captured. Run Step 2 to build the frame TSDF.`);
                 break;
             }
 
-            // Step 1 complete: store points, restore camera colours, keep rays visible
-            case 'points':
-                pendingPoints = data;
-                cameraHelpers.forEach(h => {
-                    if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
-                });
-                updateStatus('Step 1 Complete: All depth maps rendered. Run Step 2 to reconstruct the point cloud.');
-                break;
-
-            case 'voxels':
-                renderVoxels(data);
-                if (workerResolvers.has('voxels')) {
-                    workerResolvers.get('voxels')(data);
-                    workerResolvers.delete('voxels');
-                }
-                break;
-
-            case 'fusing_progress': {
-                const percent = (data.progress * 100).toFixed(0);
+            case 'frame_tsdf_generated':
+                activeCameraIndex = data.cameraIndex;
+                frameDistancesBuffer = data.distances;
                 distancesBuffer = data.distances;
-
-                // Highlight cameras: green = fused, yellow = active, blue = pending
-                if (data.cameraIndex !== undefined) {
-                    cameraHelpers.forEach((h, i) => {
-                        if (h.children[0]) {
-                            const color = i < data.cameraIndex ? 0xa3be8c  // Nord14 green — done
-                                        : i === data.cameraIndex ? 0xebcb8b // Nord13 yellow — active
-                                        : 0x88c0d0;                          // Nord8 blue — pending
-                            h.children[0].material.color.setHex(color);
-                        }
-                    });
-                }
-
-                if (data.isDone) {
-                    // Restore all camera icons to default colour
-                    cameraHelpers.forEach(h => {
-                        if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
-                    });
-                    stopVoxelIntegration();
-                    updateVoxelColors(data.distances);
-                    updateStatus(`Step 4 Complete: TSDF field integrated in ${data.time.toFixed(2)}ms. Run Step 5 to extract the mesh.`);
-                } else {
-                    updateVoxelIntegration(data.progress);
-                    updateStatus(`Step 4: Integrating TSDF... camera ${data.cameraIndex + 1} / ${cameraHelpers.length} (${percent}%)`);
-                }
-                break;
-            }
-
-            case 'extracted': {
-                distancesBuffer = data;
-                renderMesh(data);
-                setVis('gaussians', false);
-                setVis('points', false);
-                setVis('voxels', false);
-                setVis('mesh', true);
-                updateStatus('Step 5 Complete: Mesh Extracted via Marching Cubes.');
-                break;
-            }
-
-            case 'play_ready':
-                if (workerResolvers.has('play_ready')) {
-                    workerResolvers.get('play_ready')(data);
-                    workerResolvers.delete('play_ready');
-                }
+                renderVoxels(data.voxelCenters);
+                updateVoxelColors(data.distances);
+                markStepComplete(2, { nextStep: 3 });
+                resolveWorker('frame_tsdf_generated', data);
+                console.debug('frame_tsdf_generated', data.debug);
+                updateStatus(
+                    `Step 2 Complete: Frame TSDF generated for camera ${data.cameraIndex + 1}. `
+                    + `[debug: ${formatVolumeDebug(data.debug)}]`,
+                );
                 break;
 
-            case 'play_render_done':
-                if (workerResolvers.has('play_render_done')) {
-                    workerResolvers.get('play_render_done')(data);
-                    workerResolvers.delete('play_render_done');
-                }
-                break;
-
-            case 'play_fuse_done':
+            case 'tsdf_fused':
+                activeCameraIndex = data.cameraIndex;
+                globalDistancesBuffer = data.distances;
                 distancesBuffer = data.distances;
                 updateVoxelColors(data.distances);
-                if (workerResolvers.has('play_fuse_done')) {
-                    workerResolvers.get('play_fuse_done')(data);
-                    workerResolvers.delete('play_fuse_done');
-                }
+                stopVoxelIntegration({ preserveColors: true });
+                markStepComplete(3, { nextStep: 4 });
+                resolveWorker('tsdf_fused', data);
+                console.debug('tsdf_fused', data.debug);
+                updateStatus(
+                    data.skipped
+                        ? `Step 3: Camera ${data.cameraIndex + 1} initialized the global TSDF. [debug: ${formatVolumeDebug(data.debug)}]`
+                        : `Step 3 Complete: Camera ${data.cameraIndex + 1} fused into the global TSDF. [debug: ${formatVolumeDebug(data.debug)}]`,
+                );
                 break;
 
+            case 'mesh_ready': {
+                if (data.distances) {
+                    distancesBuffer = data.distances;
+                    renderMesh(data.distances);
+                }
+                markStepComplete(4, { nextStep: 0 });
+                resolveWorker('mesh_ready', data);
+                updateStatus(`Step 4 Complete: Mesh extracted from the ${data.source ?? 'latest'} TSDF.`);
+                break;
+            }
+
             case 'reset_done': {
-                currentStep = 0;
-                pendingPoints = null;
-                distancesBuffer = null;
+                resetManualProgress();
                 accumulatedPointPositions = null;
+                globalDistancesBuffer = null;
+                distancesBuffer = null;
+                workerNeedsInit = true;
+                clearPointCloud();
                 stopPointReveal({ showAll: false });
                 stopVoxelReveal({ showAll: false });
                 stopVoxelIntegration();
-                highlightStep(0); // clears all highlights
+                updateStepIndicators({ activeStep: 0, activeProgress: 0, nextStep: 1, completedStep: 0 });
                 clearScanRays();
                 gaussianClouds.forEach(m => scene.remove(m));
                 gaussianClouds = createGaussianCloud(params.type);
                 gaussianClouds.forEach(m => scene.add(m));
+                syncPointCloudToGaussians();
                 setVis('gaussians', true);
-                setVis('camera', false);
-                setVis('points', false);
+                setVis('camera', true);
+                setVis('points', true);
                 setVis('voxels', false);
                 setVis('mesh', false);
                 cameraHelpers.forEach(h => {
@@ -891,7 +922,7 @@ function initWorker() {
                         h.depthTexture.needsUpdate = true;
                     }
                 });
-                updateStatus('Reset Complete. Ready for Step 1.');
+                updateStatus('Reset Complete. Ready for Step 1: Acquire Depth.');
                 // Abort any in-progress auto-play
                 autoPlayState.playing = false;
                 autoPlayState.paused = false;
@@ -915,10 +946,19 @@ function applyVis() {
         const show = g === 'all' || (Array.isArray(g) ? g.includes(i) : g === i);
         m.visible = params.showGaussians && show;
     });
-    pointCloud.visible = params.showPoints && stepWants.points;
-    voxelCloud.visible = params.showVoxels && stepWants.voxels;
-    marchingCubes.visible = params.showMesh && stepWants.mesh;
-    marchingWireframe.visible = params.showMesh && stepWants.mesh;
+    if (pointCloud) {
+        const pointCount = pointCloud.geometry.attributes.position?.count ?? 0;
+        pointCloud.visible = params.showPoints && stepWants.points && pointCount > 0;
+    }
+    if (voxelCloud) {
+        voxelCloud.visible = params.showVoxels && stepWants.voxels;
+    }
+    if (marchingCubes) {
+        marchingCubes.visible = params.showMesh && stepWants.mesh;
+    }
+    if (marchingWireframe) {
+        marchingWireframe.visible = params.showMesh && stepWants.mesh;
+    }
     cameraHelpers.forEach(h => { h.visible = params.showCamera && stepWants.camera; });
 }
 
@@ -932,83 +972,273 @@ function setVis(key, value) {
     applyVis();
 }
 
-function highlightStep(step) {
-    window._stepCtrls.forEach((c, i) => {
-        c.domElement.classList.toggle('active-step', i === step - 1);
+function setVisibilityToggle(key, value) {
+    params[key] = value;
+    visibilityControllers[key]?.updateDisplay();
+}
+
+function setManualVisibilityState({
+    showGaussians = params.showGaussians,
+    showCamera = params.showCamera,
+    showPoints = params.showPoints,
+    showVoxels = params.showVoxels,
+    showMesh = params.showMesh,
+} = {}) {
+    stepWants.gaussians = 'all';
+    stepWants.camera = true;
+    stepWants.points = true;
+    stepWants.voxels = true;
+    stepWants.mesh = true;
+
+    setVisibilityToggle('showGaussians', showGaussians);
+    setVisibilityToggle('showCamera', showCamera);
+    setVisibilityToggle('showPoints', showPoints);
+    setVisibilityToggle('showVoxels', showVoxels);
+    setVisibilityToggle('showMesh', showMesh);
+    applyVis();
+}
+
+function formatVolumeDebug(debug) {
+    if (!debug) return '';
+    const parts = [];
+
+    if (debug.frame) {
+        parts.push(
+            `frame vox=${debug.frame.observedVoxels}`,
+            `frame wSum=${debug.frame.weightSum.toFixed(1)}`,
+            `frame wMax=${debug.frame.maxWeight.toFixed(1)}`,
+        );
+    } else {
+        parts.push(
+            `vox=${debug.observedVoxels}`,
+            `wSum=${debug.weightSum.toFixed(1)}`,
+            `wMax=${debug.maxWeight.toFixed(1)}`,
+        );
+    }
+
+    if (debug.global) {
+        parts.push(
+            `global vox=${debug.global.observedVoxels}`,
+            `global wSum=${debug.global.weightSum.toFixed(1)}`,
+            `changed=${debug.changedVoxels}`,
+        );
+    }
+
+    return parts.join(', ');
+}
+
+function resolveWorker(type, data) {
+    if (!workerResolvers.has(type)) return;
+    workerResolvers.get(type)(data);
+    workerResolvers.delete(type);
+}
+
+function highlightCamera(cameraIndex) {
+    cameraHelpers.forEach((h, i) => {
+        if (h.children[0]) h.children[0].material.color.setHex(i === cameraIndex ? 0xebcb8b : 0x88c0d0);
     });
+}
+
+function showSingleDepthMap(cameraIndex, depthMap) {
+    cameraHelpers.forEach((icon, idx) => {
+        if (!icon?.depthCtx) return;
+        const ctx = icon.depthCtx;
+        if (idx !== cameraIndex) {
+            ctx.fillStyle = '#0d1117';
+            ctx.fillRect(0, 0, DEPTH_RES, DEPTH_RES);
+            icon.depthTexture.needsUpdate = true;
+            return;
+        }
+
+        const imgData = ctx.createImageData(DEPTH_RES, DEPTH_RES);
+        let minD = Infinity;
+        let maxD = -Infinity;
+        for (let i = 0; i < depthMap.length; i++) {
+            if (depthMap[i] >= 0) {
+                minD = Math.min(minD, depthMap[i]);
+                maxD = Math.max(maxD, depthMap[i]);
+            }
+        }
+        for (let i = 0; i < depthMap.length; i++) {
+            const d = depthMap[i];
+            const idx4 = i * 4;
+            if (d < 0) {
+                imgData.data[idx4] = 13;
+                imgData.data[idx4 + 1] = 17;
+                imgData.data[idx4 + 2] = 23;
+                imgData.data[idx4 + 3] = 200;
+            } else {
+                const t = maxD > minD ? 1 - (d - minD) / (maxD - minD) : 0.5;
+                const v = Math.floor(t * 255);
+                imgData.data[idx4] = v;
+                imgData.data[idx4 + 1] = v;
+                imgData.data[idx4 + 2] = v;
+                imgData.data[idx4 + 3] = 255;
+            }
+        }
+        ctx.putImageData(imgData, 0, 0);
+        icon.depthTexture.needsUpdate = true;
+    });
+}
+
+function resetManualProgress() {
+    currentStep = 0;
+    pendingPoints = null;
+    activeDepthMap = null;
+    frameDistancesBuffer = null;
+    distancesBuffer = globalDistancesBuffer;
+    activeCameraIndex = params.currentCamera - 1;
+}
+
+function clearPointCloud() {
+    pointCloud.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+    pointCloud.geometry.setDrawRange(0, 0);
+    stopPointReveal({ showAll: false });
+    pendingPoints = null;
+}
+
+function highlightStep(step) {
+    updateStepIndicators({ activeStep: step, nextStep: step > 0 ? Math.min(step + 1, window._stepCtrls.length) : 0 });
+}
+
+function updateStepIndicators({ activeStep = stepProgressState.activeStep, activeProgress = stepProgressState.activeProgress, nextStep = stepProgressState.nextStep, completedStep = stepProgressState.completedStep } = {}) {
+    stepProgressState.activeStep = activeStep;
+    stepProgressState.activeProgress = activeProgress;
+    stepProgressState.nextStep = nextStep;
+    stepProgressState.completedStep = completedStep;
+
+    window._stepCtrls.forEach((c, i) => {
+        const stepNum = i + 1;
+        c.domElement.classList.toggle('active-step', stepNum === activeStep);
+        c.domElement.classList.toggle('next-step', stepNum === nextStep);
+        c.domElement.style.setProperty('--step-progress', `${stepNum === activeStep ? Math.max(0, Math.min(1, activeProgress)) * 100 : 0}%`);
+    });
+}
+
+function setStepProgress(step, progress, { nextStep = step < window._stepCtrls.length ? step + 1 : 0, completedStep = Math.max(stepProgressState.completedStep, step - 1) } = {}) {
+    updateStepIndicators({
+        activeStep: step,
+        activeProgress: progress,
+        nextStep,
+        completedStep,
+    });
+}
+
+function markStepComplete(step, { nextStep = step < window._stepCtrls.length ? step + 1 : 0 } = {}) {
+    updateStepIndicators({
+        activeStep: step,
+        activeProgress: 1,
+        nextStep,
+        completedStep: Math.max(stepProgressState.completedStep, step),
+    });
+}
+
+async function waitWithStepProgress(step, durationMs, startTime = performance.now(), { nextStep = step < window._stepCtrls.length ? step + 1 : 0, completedStep = Math.max(stepProgressState.completedStep, step) } = {}) {
+    let adjustedStart = startTime;
+    while (autoPlayState.playing) {
+        if (autoPlayState.paused) {
+            const pauseStarted = performance.now();
+            await new Promise(r => { resumeResolve = r; });
+            adjustedStart += performance.now() - pauseStarted;
+            continue;
+        }
+
+        const progress = Math.min(1, (performance.now() - adjustedStart) / durationMs);
+        setStepProgress(step, progress, { nextStep, completedStep: Math.max(stepProgressState.completedStep, step - 1) });
+        if (progress >= 1) {
+            markStepComplete(step, { nextStep });
+            return;
+        }
+        await new Promise(r => setTimeout(r, 50));
+    }
 }
 
 function triggerStep(step) {
     if (step === 1) {
+        activeCameraIndex = params.currentCamera - 1;
         currentStep = 1;
-        highlightStep(1);
+        setStepProgress(1, 0, { nextStep: 2, completedStep: 0 });
         clearScanRays();
-        setVis('gaussians', true);
-        setVis('camera', true);
-        setVis('points', false);
-        setVis('voxels', false);
-        setVis('mesh', false);
-        sendInitToWorker();
-        worker.postMessage({ type: 'step1_render' });
+        setManualVisibilityState({
+            showGaussians: true,
+            showCamera: true,
+            showPoints: true,
+            showVoxels: false,
+            showMesh: false,
+        });
+        if (workerNeedsInit) sendInitToWorker();
+        worker.postMessage({ type: 'acquire_depth', data: { cameraIndex: activeCameraIndex } });
 
     } else if (step === 2) {
         if (currentStep < 1) return updateStatus('Error: Complete Step 1 first.');
         if (!pendingPoints) return updateStatus('Error: Step 1 not finished yet.');
         currentStep = 2;
-        highlightStep(2);
-        clearScanRays();
-        setVis('gaussians', false);
-        setVis('camera', false);
-        setVis('points', true);
-        setVis('voxels', false);
-        setVis('mesh', false);
-        renderPoints(pendingPoints);
-        updateStatus('Step 2: Reconstructing point cloud...');
-
-    } else if (step === 3) {
-        if (currentStep < 2) return updateStatus('Error: Complete Step 2 first.');
-        currentStep = 3;
-        highlightStep(3);
-        updateStatus('Step 3: Marking active TSDF voxels...');
-        setVis('gaussians', false);
-        setVis('camera', false);
-        setVis('points', true);
-        setVis('voxels', true);
-        setVis('mesh', false);
-        worker.postMessage({
-            type: 'step3_voxelize',
-            data: { resolution: params.resolution, mu: getMu() },
+        setStepProgress(2, 0, { nextStep: 3, completedStep: 1 });
+        setManualVisibilityState({
+            showGaussians: false,
+            showCamera: true,
+            showPoints: true,
+            showVoxels: true,
+            showMesh: false,
         });
-
-    } else if (step === 4) {
-        if (currentStep < 3) return updateStatus('Error: Complete Step 3 first.');
-        currentStep = 4;
-        highlightStep(4);
-        stopVoxelReveal();
-        updateStatus('Step 4: Integrating TSDF...');
-        setVis('gaussians', false);
-        setVis('camera', true);
-        setVis('points', false);
-        setVis('voxels', true);
-        setVis('mesh', false);
+        renderPoints(pendingPoints);
+        updateStatus('Step 2: Generating the frame TSDF...');
         worker.postMessage({
-            type: 'step4_fuse',
+            type: 'generate_tsdf',
             data: {
+                cameraIndex: activeCameraIndex,
+                size: params.resolution,
+                extent: 2.0,
                 mu: getMu(),
                 observationWeight: params.observationWeight,
                 maxTSDFWeight: params.maxTSDFWeight,
             },
         });
 
-    } else if (step === 5) {
-        if (currentStep < 4) return updateStatus('Error: Complete Step 4 first.');
-        currentStep = 5;
-        highlightStep(5);
-        worker.postMessage({ type: 'step5_extract' });
+    } else if (step === 3) {
+        if (currentStep < 2) return updateStatus('Error: Complete Step 2 first.');
+        currentStep = 3;
+        setStepProgress(3, 0, { nextStep: 4, completedStep: 2 });
+        updateStatus('Step 3: Fusing frame TSDF into the global TSDF...');
+        setManualVisibilityState({
+            showGaussians: false,
+            showCamera: true,
+            showPoints: true,
+            showVoxels: true,
+            showMesh: false,
+        });
+        voxelIntegrationState.active = true;
+        updateVoxelIntegration(0.5);
+        worker.postMessage({
+            type: 'fuse_tsdf',
+            data: {
+                cameraIndex: activeCameraIndex,
+                size: params.resolution,
+                extent: 2.0,
+                mu: getMu(),
+                observationWeight: params.observationWeight,
+                maxTSDFWeight: params.maxTSDFWeight,
+            },
+        });
+
+    } else if (step === 4) {
+        if (currentStep < 3) return updateStatus('Error: Complete Step 3 first.');
+        currentStep = 4;
+        setStepProgress(4, 0, { nextStep: 0, completedStep: 3 });
+        stopVoxelReveal();
+        updateStatus('Step 4: Running Marching Cubes on the latest TSDF...');
+        setManualVisibilityState({
+            showGaussians: false,
+            showCamera: false,
+            showPoints: false,
+            showVoxels: false,
+            showMesh: true,
+        });
+        worker.postMessage({ type: 'extract_mesh' });
     }
 }
 
-function renderPoints(data) {
+function renderPoints(data, { accumulate = false } = {}) {
     const newCount = data.length / 7;
     const newPositions = new Float32Array(newCount * 3);
     for (let i = 0; i < newCount; i++) {
@@ -1017,8 +1247,7 @@ function renderPoints(data) {
         newPositions[i * 3 + 2] = data[i * 7 + 2];
     }
 
-    // In auto-play, prepend accumulated positions from previous cameras
-    const prevCount = accumulatedPointPositions ? accumulatedPointPositions.length / 3 : 0;
+    const prevCount = accumulate && accumulatedPointPositions ? accumulatedPointPositions.length / 3 : 0;
     let positions;
     if (prevCount > 0) {
         positions = new Float32Array(prevCount * 3 + newCount * 3);
@@ -1055,6 +1284,15 @@ function renderVoxels(data) {
     voxelRevealState.totalPoints = data.length / 3;
     voxelRevealState.currentCount = 0;
     stopVoxelIntegration();
+}
+
+function showActiveVoxelPreview() {
+    voxelCloud.geometry.deleteAttribute('color');
+    voxelCloud.material.vertexColors = false;
+    voxelCloud.material.needsUpdate = true;
+    voxelCloud.material.color.setHex(0xebcb8b);
+    voxelCloud.material.opacity = 0.4;
+    voxelCloud.material.size = 0.03;
 }
 
 function renderMesh(distances) {
@@ -1133,77 +1371,139 @@ async function startAutoPlay() {
     accumulatedPointPositions = null;
 
     // Reset visuals
-    setVis('gaussians', false);
-    setVis('camera', false);
-    setVis('points', false);
-    setVis('voxels', false);
-    setVis('mesh', false);
+    setManualVisibilityState({
+        showGaussians: false,
+        showCamera: true,
+        showPoints: true,
+        showVoxels: false,
+        showMesh: false,
+    });
     clearScanRays();
-    currentStep = 0;
-    highlightStep(0);
+    resetManualProgress();
+    updateStepIndicators({ activeStep: 0, activeProgress: 0, nextStep: 1, completedStep: 0 });
 
-    // Init worker: reset volume + build per-camera point clouds
-    updateStatus('Auto Play: Initialising...');
+    updateStatus('Auto Play: Initialising KinectFusion-style pipeline...');
     sendInitToWorker();
-    worker.postMessage({ type: 'play_init' });
-    const cameraPointsData = await waitForWorkerMsg('play_ready');
-
-    // Pre-populate voxel cloud so SDF colours can update progressively (keep hidden until fuse step)
-    worker.postMessage({ type: 'step3_voxelize', data: { resolution: params.resolution, mu: getMu() } });
-    await waitForWorkerMsg('voxels');
 
     for (let c = 0; c < CAM_COUNT_MAIN; c++) {
         if (!autoPlayState.playing) break;
+        activeCameraIndex = c;
+        params.currentCamera = c + 1;
 
-        // ── Step 1: sector gaussian + depth map ──────────────────────────────
-        highlightStep(1);
-        updateStatus(`Camera ${c + 1}/8 — Step 1: Rendering depth map...`);
-        addSector(c);
-        setVis('camera', true);
-        cameraHelpers.forEach((h, i) => {
-            if (h.children[0]) h.children[0].material.color.setHex(i === c ? 0xebcb8b : 0x88c0d0);
+        // ── Step 1: Acquire Depth ────────────────────────────────────────────
+        setStepProgress(1, 0, { nextStep: 2, completedStep: 0 });
+        updateStatus(`Camera ${c + 1}/8 — Step 1: Acquiring depth...`);
+        setManualVisibilityState({
+            showGaussians: true,
+            showCamera: true,
+            showPoints: true,
+            showVoxels: false,
+            showMesh: false,
         });
+        addSector(c);
+        renderGaussianSectorPoints(c);
+        clearScanRays();
+        highlightCamera(c);
         const t1 = performance.now();
-        worker.postMessage({ type: 'play_render', data: { cameraIndex: c } });
-        await waitForWorkerMsg('play_render_done');
-        await waitAtLeast(3000, t1);
-        await checkPause();
+        worker.postMessage({ type: 'acquire_depth', data: { cameraIndex: c } });
+        await waitForWorkerMsg('depth_acquired');
+        await waitWithStepProgress(1, AUTO_PLAY_STEP_HOLD_MS, t1, { nextStep: 2 });
+        if (!autoPlayState.playing) break;
 
-        // ── Step 2: point cloud ───────────────────────────────────────────────
-        highlightStep(2);
-        updateStatus(`Camera ${c + 1}/8 — Step 2: Point cloud`);
-        renderPoints(cameraPointsData[c]);
-        setVis('points', true);
-        await waitAtLeast(3000);
-        await checkPause();
+        // ── Step 2: Generate TSDF ────────────────────────────────────────────
+        setStepProgress(2, 0, { nextStep: 3, completedStep: 1 });
+        updateStatus(`Camera ${c + 1}/8 — Step 2: Generating frame TSDF...`);
+        setManualVisibilityState({
+            showGaussians: false,
+            showCamera: true,
+            showPoints: true,
+            showVoxels: true,
+            showMesh: false,
+        });
+        renderPoints(pendingPoints, { accumulate: false });
+        worker.postMessage({
+            type: 'generate_tsdf',
+            data: {
+                cameraIndex: c,
+                size: params.resolution,
+                extent: 2.0,
+                mu: getMu(),
+                observationWeight: params.observationWeight,
+                maxTSDFWeight: params.maxTSDFWeight,
+            },
+        });
+        await waitForWorkerMsg('frame_tsdf_generated');
+        await waitWithStepProgress(2, AUTO_PLAY_STEP_HOLD_MS, performance.now(), { nextStep: 3 });
+        if (!autoPlayState.playing) break;
 
-        // Accumulate this camera's points for the next camera's display
-        accumulatedPointPositions = pointCloud.geometry.attributes.position.array.slice();
+        accumulatedPointPositions = null;
 
-        // ── Step 3: fuse ──────────────────────────────────────────────────────
-        highlightStep(3);
-        updateStatus(`Camera ${c + 1}/8 — Step 3: Fusing into TSDF volume...`);
-        setVis('voxels', true);
-        voxelIntegrationState.active = true;
-        const t3 = performance.now();
-        worker.postMessage({ type: 'play_fuse', data: { cameraIndex: c } });
-        await waitForWorkerMsg('play_fuse_done');
-        stopVoxelIntegration();
-        await waitAtLeast(3000, t3);
-        await checkPause();
+        if (c === 0) {
+            markStepComplete(3, { nextStep: 4 });
+            updateStatus('Camera 1/8 — Step 3 skipped: first frame initializes the global TSDF.');
+            await waitAtLeast(AUTO_PLAY_STEP_HOLD_MS, performance.now());
+        } else {
+            // ── Step 3: TSDF Fuse ────────────────────────────────────────────
+            setStepProgress(3, 0, { nextStep: 4, completedStep: 2 });
+            updateStatus(`Camera ${c + 1}/8 — Step 3: Fusing frame TSDF...`);
+            setManualVisibilityState({
+                showGaussians: false,
+                showCamera: true,
+                showPoints: true,
+                showVoxels: true,
+                showMesh: false,
+            });
+            voxelIntegrationState.active = true;
+            updateVoxelIntegration(0.5);
+            const t3 = performance.now();
+            worker.postMessage({
+                type: 'fuse_tsdf',
+                data: {
+                    cameraIndex: c,
+                    size: params.resolution,
+                    extent: 2.0,
+                    mu: getMu(),
+                    observationWeight: params.observationWeight,
+                    maxTSDFWeight: params.maxTSDFWeight,
+                },
+            });
+            await waitForWorkerMsg('tsdf_fused');
+            await waitWithStepProgress(3, AUTO_PLAY_STEP_HOLD_MS, t3, { nextStep: 4 });
+            if (!autoPlayState.playing) break;
+        }
 
-        setVis('voxels', false); // hide voxels after fuse step
+        if (c === 0) {
+            worker.postMessage({
+                type: 'fuse_tsdf',
+                data: {
+                    cameraIndex: c,
+                    size: params.resolution,
+                    extent: 2.0,
+                    mu: getMu(),
+                    observationWeight: params.observationWeight,
+                    maxTSDFWeight: params.maxTSDFWeight,
+                },
+            });
+            await waitForWorkerMsg('tsdf_fused');
+        }
+
+        // ── Step 4: Marching Cubes ───────────────────────────────────────────
+        setStepProgress(4, 0, { nextStep: c < CAM_COUNT_MAIN - 1 ? 1 : 0, completedStep: 3 });
+        updateStatus(`Camera ${c + 1}/8 — Step 4: Running Marching Cubes...`);
+        setManualVisibilityState({
+            showGaussians: false,
+            showCamera: false,
+            showPoints: false,
+            showVoxels: false,
+            showMesh: true,
+        });
+        const t4 = performance.now();
+        worker.postMessage({ type: 'extract_mesh' });
+        await waitForWorkerMsg('mesh_ready');
+        await waitWithStepProgress(4, AUTO_PLAY_STEP_HOLD_MS, t4, { nextStep: c < CAM_COUNT_MAIN - 1 ? 1 : 0 });
         cameraHelpers.forEach(h => {
             if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
         });
-    }
-
-    if (autoPlayState.playing) {
-        // Extract mesh
-        highlightStep(5);
-        updateStatus('All cameras fused. Extracting mesh...');
-        worker.postMessage({ type: 'step5_extract' });
-        // extracted handler will show the mesh
     }
 
     autoPlayState.playing = false;
@@ -1222,9 +1522,10 @@ function sendInitToWorker() {
             maxTSDFWeight: params.maxTSDFWeight,
             type: params.type,
             noise: params.noise,
+            gsplatNoise: params.gsplatNoise,
             outliers: params.outliers,
-            // Pass gaussian positions so the worker can build a point cloud that
-            // reflects the gsplat distribution (artifacts included).
+            // Pass gaussian positions so the worker can synthesize depth maps
+            // from the gsplat distribution before back-projecting them.
             gaussianPoints: getGaussianRawPoints(),
         },
     });
@@ -1281,7 +1582,6 @@ function animate() {
 
         if (t >= 1) {
             stopPointReveal();
-            updateStatus('Step 2 Complete: Point cloud reconstructed from the depth maps.');
         }
     }
 
@@ -1301,7 +1601,6 @@ function animate() {
 
         if (t >= 1) {
             stopVoxelReveal();
-            updateStatus('Step 3 Complete: Active TSDF voxels identified.');
         }
     }
 

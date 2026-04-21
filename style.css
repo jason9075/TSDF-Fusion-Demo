@@ -192,10 +192,44 @@ header p {
 }
 
 /* Active step button highlight */
+.lil-gui .controller.step-controller > .widget > button {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+    transition: background-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.lil-gui .controller.step-controller > .widget > button::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    width: var(--step-progress, 0%);
+    background: linear-gradient(90deg, rgba(94, 129, 172, 0.9), rgba(136, 192, 208, 0.85));
+    z-index: -1;
+    transition: width 0.08s linear;
+}
+
 .lil-gui .controller.active-step > .widget > button {
     background: var(--nord10) !important;
     color: var(--nord6) !important;
     font-weight: 600;
+    box-shadow: inset 0 0 0 1px rgba(236, 239, 244, 0.18);
+}
+
+.lil-gui .controller.next-step > .widget > button {
+    box-shadow: inset 0 0 0 1px rgba(235, 203, 139, 0.6);
+    color: var(--nord13) !important;
+}
+
+.lil-gui .controller.next-step > .widget > button::after {
+    content: "NEXT";
+    position: absolute;
+    right: 0.55rem;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.55rem;
+    letter-spacing: 0.08em;
+    color: rgba(235, 203, 139, 0.92);
 }
 
 /* Scrollbar styling */

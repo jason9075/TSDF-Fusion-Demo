@@ -95,27 +95,25 @@
                         <h3 class="lang-en">4. Reconstruction Pipeline</h3>
                         <h3 class="lang-zh hidden">4. 重建流程</h3>
                         <div class="lang-en">
-                            <p>This demo exposes the reconstruction process as five explicit UI steps. The underlying idea is: cameras observe a surface, those observations become points, points influence nearby voxels, voxels store a TSDF field, and the zero level set becomes a mesh.</p>
+                            <p>This demo follows a simplified KinectFusion-style loop: the active camera captures one depth map, that single observation becomes a frame TSDF, the frame TSDF is fused into a global TSDF, and the latest field is converted into a mesh.</p>
                             <ol>
-                                <li><strong>Render Depth Maps</strong>: Each virtual camera looks toward the object and records the first surface hit along every ray. This produces a small depth image per camera, similar to what a depth sensor or differentiable renderer would provide.</li>
-                                <li><strong>Reconstruct Point Cloud</strong>: Every valid depth pixel is lifted back into 3D space to form a point cloud. The demo also estimates a surface normal at each hit point, because TSDF integration needs both a position and an orientation to decide whether a voxel is in front of or behind the surface.</li>
-                                <li><strong>Mark Active Voxels</strong>: The point cloud is not yet a volume. In this step, the algorithm finds which voxels lie within the truncation band around the observed points. The yellow voxels show the active region where future TSDF updates are allowed to happen.</li>
-                                <li><strong>Integrate TSDF</strong>: For each point, nearby voxels receive a signed distance value computed along the point normal. Repeated observations are merged by weighted averaging, so noise is smoothed out and the scalar field becomes more stable. This step builds the hidden volumetric field that Marching Cubes will later convert into a surface.</li>
-                                <li><strong>Extract Mesh</strong>: Marching Cubes scans the voxel grid and connects places where the TSDF crosses zero. This converts the invisible scalar field into an explicit triangle mesh that can be shaded and inspected.</li>
+                                <li><strong>Acquire Depth</strong>: The active virtual camera records the first visible surface hit along each ray. This produces one low-resolution depth map and one point-cloud observation for the current frame.</li>
+                                <li><strong>Generate TSDF</strong>: The current frame point cloud updates a fresh frame-local TSDF. The colored voxel band shows which cells are affected by that one observation.</li>
+                                <li><strong>TSDF Fuse</strong>: The current frame TSDF is merged into the persistent global TSDF by weighted averaging. Camera 1 initializes the global TSDF; later cameras refine it.</li>
+                                <li><strong>Marching Cubes</strong>: Marching Cubes runs on the latest TSDF, meaning the initialized global TSDF for camera 1 and the fused global TSDF for later cameras.</li>
                             </ol>
-                            <p style="font-size: 0.8rem; font-style: italic; opacity: 0.7;">In production systems, steps 3 and 4 are usually interleaved continuously as new frames arrive. They are separated here to make the data flow easier to see.</p>
+                            <p style="font-size: 0.8rem; font-style: italic; opacity: 0.7;">This is still a browser-scale approximation: it uses low-resolution synthetic depth and lightweight normal handling, but the data dependency now matches the core demo loop of depth → frame TSDF → global TSDF → mesh extraction.</p>
                         </div>
 
                         <div class="lang-zh hidden">
-                            <p>這個 Demo 把重建流程拆成五個明確的 UI 步驟。核心概念是：相機先觀察表面，觀測再轉成點雲，點雲影響鄰近體素，體素中儲存 TSDF 數值場，最後從零等值面提取出網格。</p>
+                            <p>這個 Demo 採用簡化版的 KinectFusion 教學流程：先由目前的虛擬相機擷取單張深度圖，再把該觀測轉成單幀 TSDF，接著融合進全域 TSDF，最後把最新的數值場提取成網格。</p>
                             <ol>
-                                <li><strong>Render Depth Maps</strong>：每個虛擬相機朝物體中心發射視線，記錄每條光線第一次撞到表面的深度。這會生成每個相機自己的深度圖，概念上類似深度感測器或可微渲染器輸出的幾何觀測。</li>
-                                <li><strong>Reconstruct Point Cloud</strong>：把每個有效的深度像素重新投影回 3D 空間，形成點雲。這個 Demo 也同時計算每個點的表面法向量，因為 TSDF 積分不只需要位置，還需要知道體素位於表面的前方還是後方。</li>
-                                <li><strong>Mark Active Voxels</strong>：點雲本身還不是體積表示。在這一步中，演算法會找出哪些體素落在觀測點周圍的截斷帶內。畫面中的黃色體素代表會參與後續 TSDF 更新的 active region。</li>
-                                <li><strong>Integrate TSDF</strong>：對每個點而言，鄰近體素會根據該點的法向量收到一個符號距離值。多次觀測會透過加權平均整合，因此雜訊會被平滑，數值場也會逐漸穩定。這一步建立的是隱藏在體積中的數值場，之後 Marching Cubes 會再把它轉換成可見表面。</li>
-                                <li><strong>Extract Mesh</strong>：Marching Cubes 會掃描整個體素網格，找出 TSDF 穿越零值的位置並連接成三角形。這一步把原本不可見的純量場轉換成可直接渲染與檢視的顯式網格。</li>
+                                <li><strong>Acquire Depth</strong>：目前的虛擬相機朝物體中心發射視線，記錄每條光線第一次撞到表面的深度。這一步會得到單幀深度圖與對應的點雲觀測。</li>
+                                <li><strong>Generate TSDF</strong>：把目前幀的點雲寫入一個新的單幀 TSDF。畫面中的體素帶顯示這次觀測實際影響到哪些格子。</li>
+                                <li><strong>TSDF Fuse</strong>：把單幀 TSDF 以加權平均方式融合進持久的全域 TSDF。第一台相機只負責初始化全域 TSDF，之後的相機才會持續精煉它。</li>
+                                <li><strong>Marching Cubes</strong>：Marching Cubes 永遠對最新的 TSDF 執行，也就是第一台相機初始化出的全域 TSDF，或後續融合後的全域 TSDF。</li>
                             </ol>
-                            <p style="font-size: 0.8rem; font-style: italic; opacity: 0.7;">在真實系統中，第 3 與第 4 步通常會隨著新影像輸入持續交錯進行。這裡刻意拆開，是為了讓資料流與演算法角色更容易理解。</p>
+                            <p style="font-size: 0.8rem; font-style: italic; opacity: 0.7;">這仍然是瀏覽器規模的近似版：它使用低解析度的合成深度與較輕量的法向處理，但資料依賴已對齊這個 demo 的核心流程：depth → frame TSDF → global TSDF → mesh extraction。</p>
                         </div>
                     </section>
 
@@ -163,7 +161,7 @@
                             <h4>Gaussian Splat <small>(Step 1)</small></h4>
                             <ul>
                                 <li><strong>Surface Type</strong>: The underlying geometry (sphere or torus) that gaussian centers are sampled from. Changing this regenerates the whole splat scene.</li>
-                                <li><strong>Gaussian Count</strong>: Number of gaussian instances. More gaussians = denser point cloud in Step 2, better TSDF coverage in Step 4.</li>
+                                <li><strong>Gaussian Count</strong>: Number of gaussian instances. More gaussians = denser point clouds and more stable frame/global TSDF updates.</li>
                                 <li><strong>Splat Noise</strong>: Controls the probability and magnitude of 3DGS-style artifacts.
                                     <ul>
                                         <li><strong>0.0</strong>: All gaussians sit exactly on the ideal surface with no jitter — a perfect clean scene.</li>
@@ -175,19 +173,19 @@
 
                             <h4>TSDF Volume</h4>
                             <ul>
-                                <li><strong>Truncation μ in voxels (Steps 3–4)</strong>: The half-width of the truncation band, expressed as a <em>number of voxels</em>. The actual world-space distance is $\mu = \mu_\text{voxels} \times \text{voxelSize}$, so it automatically scales with resolution.
+                                <li><strong>Truncation μ in voxels (Steps 2–3)</strong>: The half-width of the truncation band, expressed as a <em>number of voxels</em>. The actual world-space distance is $\mu = \mu_\text{voxels} \times \text{voxelSize}$, so it automatically scales with resolution.
                                     <ul>
-                                        <li>In Step 3, sets the active voxel neighborhood radius: <code>range = μ<sub>voxels</sub></code> voxels on each side of a surface point.</li>
-                                        <li>In Step 4, only voxels where $|\text{SDF}| \leq \mu$ are updated.</li>
+                                        <li>In Step 2, it defines the frame-TSDF truncation neighborhood around each observation.</li>
+                                        <li>In Step 3, the same truncation band controls how much of that frame TSDF contributes during fusion.</li>
                                         <li>Larger μ → wider band, smoother field, but blurrier surfaces and more outlier influence. KinectFusion recommends 3–5 voxels.</li>
                                         <li>Smaller μ → sharper surfaces, but gaps may appear where surface coverage is thin.</li>
                                     </ul>
                                 </li>
-                                <li><strong>Observation Weight (Step 4)</strong>: The per-point weight $w_i$ in the weighted average
+                                <li><strong>Observation Weight (Steps 2–3)</strong>: The per-point weight $w_i$ in the weighted average
                                     $$D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$$
                                     Higher values make each new observation dominate the running average more. In this demo every gaussian point is fused exactly once, so changing this parameter uniformly scales all contributions — the relative effect on the final SDF is minimal. In a real incremental system (e.g. KinectFusion), a higher weight would let new depth frames correct the field faster, but would also amplify the influence of outlier points.
                                 </li>
-                                <li><strong>Max TSDF Weight (Step 4)</strong>: Cap on the cumulative weight $W_i$, i.e. <code>W_i = min(W_{i-1} + w_i, maxWeight)</code>. This prevents early observations from permanently dominating the average as more frames arrive.
+                                <li><strong>Max TSDF Weight (Step 3)</strong>: Cap on the cumulative weight $W_i$, i.e. <code>W_i = min(W_{i-1} + w_i, maxWeight)</code>. This prevents early observations from permanently dominating the average as more frames arrive.
                                     <ul>
                                         <li><strong>Lower cap</strong>: the field stays responsive to new data — useful in dynamic scenes where surfaces move.</li>
                                         <li><strong>Higher cap</strong>: the field converges more confidently as observations accumulate, but reacts slowly to corrections.</li>
@@ -209,7 +207,7 @@
                             <h4>Gaussian Splat <small>（Step 1）</small></h4>
                             <ul>
                                 <li><strong>Surface Type</strong>：Gaussian 中心點採樣的基底幾何（球體或環面）。更換後會重新生成整個 splat 場景。</li>
-                                <li><strong>Gaussian Count</strong>：Gaussian 實例數量。越多代表 Step 2 的點雲越密集，Step 4 的 TSDF 覆蓋率也越好。</li>
+                                <li><strong>Gaussian Count</strong>：Gaussian 實例數量。越多代表點雲越密集，單幀與全域 TSDF 也會更穩定。</li>
                                 <li><strong>Splat Noise</strong>：控制 3DGS 風格 artifact 的出現機率與偏移幅度。
                                     <ul>
                                         <li><strong>0.0</strong>：所有 gaussian 精確落在理想表面上，無任何偏移，代表完美的重建場景。</li>
@@ -221,19 +219,19 @@
 
                             <h4>TSDF Volume</h4>
                             <ul>
-                                <li><strong>Truncation μ（voxel 數，Steps 3–4）</strong>：截斷帶的半寬度，以<em>格子數</em>為單位。實際世界空間距離為 $\mu = \mu_\text{voxels} \times \text{voxelSize}$，因此會自動隨 resolution 縮放。
+                                <li><strong>Truncation μ（voxel 數，Steps 2–3）</strong>：截斷帶的半寬度，以<em>格子數</em>為單位。實際世界空間距離為 $\mu = \mu_\text{voxels} \times \text{voxelSize}$，因此會自動隨 resolution 縮放。
                                     <ul>
-                                        <li>在 Step 3 中，決定 active voxel 的鄰域半徑：每個表面點往外 <code>μ<sub>voxels</sub></code> 個格子。</li>
-                                        <li>在 Step 4 中，只有 $|\text{SDF}| \leq \mu$ 的體素才會被更新。</li>
+                                        <li>在 Step 2 中，它決定單幀 TSDF 在每個觀測點周圍的截斷鄰域。</li>
+                                        <li>在 Step 3 中，同一個截斷帶會決定這份單幀 TSDF 能如何影響全域 TSDF。</li>
                                         <li>μ 越大 → 截斷帶越寬，數值場越平滑，但表面較模糊、離群點影響範圍也更大。KinectFusion 建議使用 3–5 格。</li>
                                         <li>μ 越小 → 表面越銳利，但若點雲覆蓋率不足，可能出現破洞。</li>
                                     </ul>
                                 </li>
-                                <li><strong>Observation Weight（Step 4）</strong>：加權平均公式
+                                <li><strong>Observation Weight（Steps 2–3）</strong>：加權平均公式
                                     $$D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$$
                                     中每個點的單次觀測權重 $w_i$。數值越高，新觀測對目前均值的主導力越強。在本 demo 中每個 gaussian 點只融合一次，調整此參數等比縮放所有點的貢獻，對最終 SDF 的相對影響有限。在真實的增量式系統（如 KinectFusion）中，較高的權重讓新深度幀能更快修正數值場，但也會放大離群點的影響。
                                 </li>
-                                <li><strong>Max TSDF Weight（Step 4）</strong>：累積權重 $W_i$ 的上限，即 <code>W_i = min(W_{i-1} + w_i, maxWeight)</code>，防止早期觀測隨著幀數增加而永遠主導均值。
+                                <li><strong>Max TSDF Weight（Step 3）</strong>：累積權重 $W_i$ 的上限，即 <code>W_i = min(W_{i-1} + w_i, maxWeight)</code>，防止早期觀測隨著幀數增加而永遠主導均值。
                                     <ul>
                                         <li><strong>上限較低</strong>：數值場持續對新資料保持響應——適合動態場景或表面有移動的情況。</li>
                                         <li><strong>上限較高</strong>：觀測累積後收斂更穩定，但對後續修正的反應較慢。</li>

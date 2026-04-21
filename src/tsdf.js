@@ -15,14 +15,36 @@ export class TSDFVolume {
         this.extent = options.extent ?? 2.0;
         this.mu = options.mu ?? 0.1;
         this.maxTSDFWeight = options.maxTSDFWeight ?? 32;
-        
+
         this.numVoxels = this.size * this.size * this.size;
         this.distances = new Float32Array(this.numVoxels).fill(1.0); // 1.0 is "far" (max distance)
         this.weights = new Float32Array(this.numVoxels).fill(0.0);
-        
+
         this.voxelSize = (this.extent * 2) / this.size;
         this.sizeSq = this.size * this.size;
         this.range = Math.ceil(this.mu / this.voxelSize);
+    }
+
+    reset() {
+        this.distances.fill(1.0);
+        this.weights.fill(0.0);
+    }
+
+    clone() {
+        const next = new TSDFVolume({
+            size: this.size,
+            extent: this.extent,
+            mu: this.mu,
+            maxTSDFWeight: this.maxTSDFWeight,
+        });
+        next.distances.set(this.distances);
+        next.weights.set(this.weights);
+        return next;
+    }
+
+    copyFrom(other) {
+        this.distances.set(other.distances);
+        this.weights.set(other.weights);
     }
 
     /**
@@ -46,7 +68,7 @@ export class TSDFVolume {
      */
     fuse(points) {
         const numPoints = points.length / 7;
-        
+
         for (let i = 0; i < numPoints; i++) {
             const px = points[i * 7];
             const py = points[i * 7 + 1];
@@ -77,11 +99,11 @@ export class TSDFVolume {
 
                         // Signed distance along normal: (V - P) · N
                         const sdf = (vx - px) * nx + (vy - py) * ny + (vz - pz) * nz;
-                        
+
                         if (Math.abs(sdf) <= this.mu) {
                             const currentD = this.distances[idx];
                             const currentW = this.weights[idx];
-                            
+
                             const unclampedW = currentW + pw;
                             const nextDistance = (currentW * currentD + pw * sdf) / unclampedW;
                             this.distances[idx] = nextDistance;
@@ -91,6 +113,27 @@ export class TSDFVolume {
                 }
             }
         }
+    }
+
+    fuseVolume(other) {
+        for (let i = 0; i < this.numVoxels; i++) {
+            const incomingWeight = other.weights[i];
+            if (incomingWeight <= 0) continue;
+
+            const currentWeight = this.weights[i];
+            const totalWeight = currentWeight + incomingWeight;
+            this.distances[i] = currentWeight > 0
+                ? ((currentWeight * this.distances[i]) + (incomingWeight * other.distances[i])) / totalWeight
+                : other.distances[i];
+            this.weights[i] = Math.min(this.maxTSDFWeight, totalWeight);
+        }
+    }
+
+    getState() {
+        return {
+            distances: this.distances,
+            weights: this.weights,
+        };
     }
 
     getGridData() {
