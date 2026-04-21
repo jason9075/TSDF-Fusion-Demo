@@ -12,7 +12,7 @@ const params = {
     muVoxels: 4,
     observationWeight: 1.0,
     maxTSDFWeight: 8,
-    mcWeightThreshold: 2,
+    mcWeightThreshold: 1,
     noise: 0.05,
     gaussianCount: 500,
     gsplatNoise: 0.5,
@@ -25,15 +25,16 @@ const params = {
     showGrids: true,
     showKnowledge: () => toggleModal(true),
     cameraZoom: 4, // initial distance = length of (3,3,3)
-    currentCamera: 1,
+    observationCount: 8,
+    fastForward: false,
     type: 'sphere',
 
-    // Step Buttons
-    step1: () => triggerStep(1),
-    step2: () => triggerStep(2),
-    step3: () => triggerStep(3),
-    step4: () => triggerStep(4),
-    reset: () => resetDemo(),
+    // Step display only
+    step1: () => {},
+    step2: () => {},
+    step3: () => {},
+    step4: () => {},
+    stopAutoPlay: () => stopAutoPlay(),
 };
 
 let scene, camera, renderer, controls;
@@ -474,6 +475,7 @@ function init() {
         scene.add(icon);
         cameraHelpers.push(icon);
     }
+    highlightCamera(activeCameraIndex);
 
     // Step 4: Mesh (Marching Cubes)
     const material = new THREE.MeshPhongMaterial({ 
@@ -714,13 +716,8 @@ function setupGUI() {
         camera.position.copy(controls.target).add(offset);
         controls.update();
     });
-    gui.add(params, 'currentCamera', 1, CAM_COUNT_MAIN, 1).name('Active Camera').onChange(v => {
-        activeCameraIndex = v - 1;
-        resetManualProgress();
-        updateStepIndicators({ activeStep: 0, activeProgress: 0, nextStep: 1, completedStep: 0 });
-        clearScanRays();
-        highlightCamera(activeCameraIndex);
-    });
+    gui.add(params, 'observationCount', 1, 800, 1).name('Observation Count');
+    gui.add(params, 'fastForward').name('Fast Forward');
     let playPauseCtrl;
     params.togglePlay = () => {
         if (!autoPlayState.playing) startAutoPlay();
@@ -728,6 +725,7 @@ function setupGUI() {
     };
     playPauseCtrl = gui.add(params, 'togglePlay').name('▶ Auto Play');
     window._playPauseCtrl = playPauseCtrl;
+    gui.add(params, 'stopAutoPlay').name('■ Stop');
 
     // Shared voxel grid resolution — must be identical for TSDF volume and MarchingCubes
     // because MC reads the TSDF distances array directly (marchingCubes.field.set(distances)).
@@ -804,7 +802,7 @@ function setupGUI() {
     tsdfFolder.add(params, 'muVoxels', 1, 10, 0.5).name('Truncation μ');
     tsdfFolder.add(params, 'observationWeight', 0.1, 2.0, 0.1).name('Observation Weight');
     tsdfFolder.add(params, 'maxTSDFWeight', 1, 8, 1).name('Max TSDF Weight');
-    tsdfFolder.add(params, 'mcWeightThreshold', 2, 8, 1).name('MC Weight Threshold');
+    tsdfFolder.add(params, 'mcWeightThreshold', 1, 8, 1).name('MC Weight Threshold');
 
     const steps = gui.addFolder('Steps');
     const stepCtrls = [
@@ -813,13 +811,12 @@ function setupGUI() {
         steps.add(params, 'step3').name('3. TSDF Fuse'),
         steps.add(params, 'step4').name('4. Marching Cubes'),
     ];
-    steps.add(params, 'reset').name('Reset Everything');
     stepCtrls.forEach(ctrl => {
         ctrl.domElement.classList.add('step-controller');
         ctrl.domElement.style.setProperty('--step-progress', '0%');
+        ctrl.disable();
     });
     window._stepCtrls = stepCtrls;
-    window._setStepButtonsEnabled = (enabled) => stepCtrls.forEach(c => enabled ? c.enable() : c.disable());
     updateStepIndicators({ activeStep: 0, activeProgress: 0, nextStep: 1, completedStep: 0 });
 
     const view = gui.addFolder('Visibility');
@@ -857,13 +854,13 @@ function initWorker() {
         switch (type) {
             case 'ready':
                 workerNeedsInit = false;
-                updateStatus('System Ready. Start with Step 1: Acquire Depth.');
+                highlightCamera(activeCameraIndex);
+                updateStatus('System Ready. Use Auto Play to start the reconstruction pipeline.');
                 break;
 
             case 'depth_acquired': {
                 const { cameraIndex, depthMap, points } = data;
                 activeCameraIndex = cameraIndex;
-                params.currentCamera = cameraIndex + 1;
                 activeDepthMap = depthMap;
                 pendingPoints = points;
                 showSingleDepthMap(cameraIndex, depthMap);
@@ -937,6 +934,7 @@ function initWorker() {
                 stopVoxelIntegration();
                 updateStepIndicators({ activeStep: 0, activeProgress: 0, nextStep: 1, completedStep: 0 });
                 clearScanRays();
+                highlightCamera(activeCameraIndex);
                 gaussianClouds.forEach(m => scene.remove(m));
                 gaussianClouds = createGaussianCloud(params.type);
                 gaussianClouds.forEach(m => scene.add(m));
@@ -954,13 +952,12 @@ function initWorker() {
                         h.depthTexture.needsUpdate = true;
                     }
                 });
-                updateStatus('Reset Complete. Ready for Step 1: Acquire Depth.');
+                updateStatus('Reset Complete. Use Auto Play to start the reconstruction pipeline.');
                 // Abort any in-progress auto-play
                 autoPlayState.playing = false;
                 autoPlayState.paused = false;
                 if (resumeResolve) { resumeResolve(); resumeResolve = null; }
                 updatePlayButton();
-                window._setStepButtonsEnabled?.(true);
                 break;
             }
         }
@@ -1123,7 +1120,7 @@ function resetManualProgress() {
     frameWeightsBuffer = null;
     distancesBuffer = globalDistancesBuffer;
     weightsBuffer = globalWeightsBuffer;
-    activeCameraIndex = params.currentCamera - 1;
+    activeCameraIndex = 0;
     hoveredVoxel = null;
     hideVoxelTooltip();
 }
@@ -1333,7 +1330,7 @@ function markStepComplete(step, { nextStep = step < window._stepCtrls.length ? s
     });
 }
 
-async function waitWithStepProgress(step, durationMs, startTime = performance.now(), { nextStep = step < window._stepCtrls.length ? step + 1 : 0, completedStep = Math.max(stepProgressState.completedStep, step) } = {}) {
+async function waitWithStepProgress(step, baseDurationMs, startTime = performance.now(), { nextStep = step < window._stepCtrls.length ? step + 1 : 0, completedStep = Math.max(stepProgressState.completedStep, step) } = {}) {
     let adjustedStart = startTime;
     while (autoPlayState.playing) {
         if (autoPlayState.paused) {
@@ -1341,6 +1338,12 @@ async function waitWithStepProgress(step, durationMs, startTime = performance.no
             await new Promise(r => { resumeResolve = r; });
             adjustedStart += performance.now() - pauseStarted;
             continue;
+        }
+
+        const durationMs = params.fastForward ? 0 : baseDurationMs;
+        if (durationMs <= 0) {
+            markStepComplete(step, { nextStep });
+            return;
         }
 
         const progress = Math.min(1, (performance.now() - adjustedStart) / durationMs);
@@ -1355,7 +1358,7 @@ async function waitWithStepProgress(step, durationMs, startTime = performance.no
 
 function triggerStep(step) {
     if (step === 1) {
-        activeCameraIndex = params.currentCamera - 1;
+        activeCameraIndex = 0;
         currentStep = 1;
         setStepProgress(1, 0, { nextStep: 2, completedStep: 0 });
         clearScanRays();
@@ -1546,8 +1549,13 @@ function checkPause() {
 
 /** Wait until at least `ms` milliseconds have elapsed since `startTime`. */
 function waitAtLeast(ms, startTime = performance.now()) {
+    if (ms <= 0) return Promise.resolve();
     const remaining = ms - (performance.now() - startTime);
     return new Promise(r => setTimeout(r, Math.max(0, remaining)));
+}
+
+function getAutoPlayHoldMs() {
+    return params.fastForward ? 0 : AUTO_PLAY_STEP_HOLD_MS;
 }
 
 function updatePlayButton() {
@@ -1568,12 +1576,15 @@ function togglePause() {
     updatePlayButton();
 }
 
+function stopAutoPlay() {
+    resetDemo();
+}
+
 async function startAutoPlay() {
     if (autoPlayState.playing) return;
     autoPlayState.playing = true;
     autoPlayState.paused = false;
     updatePlayButton();
-    window._setStepButtonsEnabled?.(false);
 
     accumulatedPointPositions = null;
 
@@ -1593,14 +1604,15 @@ async function startAutoPlay() {
     updateStatus('Auto Play: Initialising KinectFusion-style pipeline...');
     sendInitToWorker();
 
-    for (let c = 0; c < CAM_COUNT_MAIN; c++) {
+    const totalObservations = Math.max(1, Math.floor(params.observationCount));
+    for (let observationIndex = 0; observationIndex < totalObservations; observationIndex++) {
         if (!autoPlayState.playing) break;
+        const c = observationIndex % CAM_COUNT_MAIN;
         activeCameraIndex = c;
-        params.currentCamera = c + 1;
 
         // ── Step 1: Acquire Depth ────────────────────────────────────────────
         setStepProgress(1, 0, { nextStep: 2, completedStep: 0 });
-        updateStatus(`Camera ${c + 1}/8 — Step 1: Acquiring depth...`);
+        updateStatus(`Observation ${observationIndex + 1}/${totalObservations} — Camera ${c + 1}/8 — Step 1: Acquiring depth...`);
         setManualVisibilityState({
             showGaussians: true,
             showCamera: true,
@@ -1616,12 +1628,13 @@ async function startAutoPlay() {
         const t1 = performance.now();
         worker.postMessage({ type: 'acquire_depth', data: { cameraIndex: c } });
         await waitForWorkerMsg('depth_acquired');
+        await checkPause();
         await waitWithStepProgress(1, AUTO_PLAY_STEP_HOLD_MS, t1, { nextStep: 2 });
         if (!autoPlayState.playing) break;
 
         // ── Step 2: Generate TSDF ────────────────────────────────────────────
         setStepProgress(2, 0, { nextStep: 3, completedStep: 1 });
-        updateStatus(`Camera ${c + 1}/8 — Step 2: Generating frame TSDF...`);
+        updateStatus(`Observation ${observationIndex + 1}/${totalObservations} — Camera ${c + 1}/8 — Step 2: Generating frame TSDF...`);
         setManualVisibilityState({
             showGaussians: false,
             showCamera: true,
@@ -1643,19 +1656,21 @@ async function startAutoPlay() {
             },
         });
         await waitForWorkerMsg('frame_tsdf_generated');
+        await checkPause();
         await waitWithStepProgress(2, AUTO_PLAY_STEP_HOLD_MS, performance.now(), { nextStep: 3 });
         if (!autoPlayState.playing) break;
 
         accumulatedPointPositions = null;
 
-        if (c === 0) {
+        if (observationIndex === 0) {
             markStepComplete(3, { nextStep: 4 });
-            updateStatus('Camera 1/8 — Step 3 skipped: first frame initializes the global TSDF.');
-            await waitAtLeast(AUTO_PLAY_STEP_HOLD_MS, performance.now());
+            updateStatus(`Observation 1/${totalObservations} — Camera 1/8 — Step 3 skipped: first frame initializes the global TSDF.`);
+            await checkPause();
+            await waitAtLeast(getAutoPlayHoldMs(), performance.now());
         } else {
             // ── Step 3: TSDF Fuse ────────────────────────────────────────────
             setStepProgress(3, 0, { nextStep: 4, completedStep: 2 });
-            updateStatus(`Camera ${c + 1}/8 — Step 3: Fusing frame TSDF...`);
+            updateStatus(`Observation ${observationIndex + 1}/${totalObservations} — Camera ${c + 1}/8 — Step 3: Fusing frame TSDF...`);
             setManualVisibilityState({
                 showGaussians: false,
                 showCamera: true,
@@ -1679,11 +1694,12 @@ async function startAutoPlay() {
                 },
             });
             await waitForWorkerMsg('tsdf_fused');
+            await checkPause();
             await waitWithStepProgress(3, AUTO_PLAY_STEP_HOLD_MS, t3, { nextStep: 4 });
             if (!autoPlayState.playing) break;
         }
 
-        if (c === 0) {
+        if (observationIndex === 0) {
             worker.postMessage({
                 type: 'fuse_tsdf',
                 data: {
@@ -1696,11 +1712,12 @@ async function startAutoPlay() {
                 },
             });
             await waitForWorkerMsg('tsdf_fused');
+            await checkPause();
         }
 
         // ── Step 4: Marching Cubes ───────────────────────────────────────────
-        setStepProgress(4, 0, { nextStep: c < CAM_COUNT_MAIN - 1 ? 1 : 0, completedStep: 3 });
-        updateStatus(`Camera ${c + 1}/8 — Step 4: Running Marching Cubes...`);
+        setStepProgress(4, 0, { nextStep: observationIndex < totalObservations - 1 ? 1 : 0, completedStep: 3 });
+        updateStatus(`Observation ${observationIndex + 1}/${totalObservations} — Camera ${c + 1}/8 — Step 4: Running Marching Cubes...`);
         setManualVisibilityState({
             showGaussians: false,
             showCamera: false,
@@ -1712,7 +1729,8 @@ async function startAutoPlay() {
         const t4 = performance.now();
         worker.postMessage({ type: 'extract_mesh', data: { weightThreshold: params.mcWeightThreshold } });
         await waitForWorkerMsg('mesh_ready');
-        await waitWithStepProgress(4, AUTO_PLAY_STEP_HOLD_MS, t4, { nextStep: c < CAM_COUNT_MAIN - 1 ? 1 : 0 });
+        await checkPause();
+        await waitWithStepProgress(4, AUTO_PLAY_STEP_HOLD_MS, t4, { nextStep: observationIndex < totalObservations - 1 ? 1 : 0 });
         cameraHelpers.forEach(h => {
             if (h.children[0]) h.children[0].material.color.setHex(0x88c0d0);
         });
@@ -1720,7 +1738,6 @@ async function startAutoPlay() {
 
     autoPlayState.playing = false;
     updatePlayButton();
-    window._setStepButtonsEnabled?.(true);
 }
 
 function sendInitToWorker() {

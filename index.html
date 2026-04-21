@@ -95,9 +95,9 @@
                         <h3 class="lang-en">4. Reconstruction Pipeline</h3>
                         <h3 class="lang-zh hidden">4. 重建流程</h3>
                         <div class="lang-en">
-                            <p>This demo follows a simplified KinectFusion-style loop: the active camera captures one depth map, that single observation becomes a frame TSDF, the frame TSDF is fused into a global TSDF, and the latest field is converted into a mesh.</p>
+                            <p>This demo follows a simplified KinectFusion-style loop: one of the eight virtual cameras captures one depth map, that single observation becomes a frame TSDF, the frame TSDF is fused into a global TSDF, and the latest field is converted into a mesh.</p>
                             <ol>
-                                <li><strong>Acquire Depth</strong>: The active virtual camera records the first visible surface hit along each ray. This produces one low-resolution depth map and one point-cloud observation for the current frame.</li>
+                                <li><strong>Acquire Depth</strong>: The current virtual camera on the 8-camera ring records the first visible surface hit along each ray. This produces one low-resolution depth map and one point-cloud observation for the current frame.</li>
                                 <li><strong>Generate TSDF</strong>: The current frame point cloud updates a fresh frame-local TSDF. The colored voxel band shows which cells are affected by that one observation.</li>
                                 <li><strong>TSDF Fuse</strong>: The current frame TSDF is merged into the persistent global TSDF by weighted averaging. Camera 1 initializes the global TSDF; later cameras refine it.</li>
                                 <li><strong>Marching Cubes</strong>: Marching Cubes runs on the latest TSDF, meaning the initialized global TSDF for camera 1 and the fused global TSDF for later cameras.</li>
@@ -106,9 +106,9 @@
                         </div>
 
                         <div class="lang-zh hidden">
-                            <p>這個 Demo 採用簡化版的 KinectFusion 教學流程：先由目前的虛擬相機擷取單張深度圖，再把該觀測轉成單幀 TSDF，接著融合進全域 TSDF，最後把最新的數值場提取成網格。</p>
+                            <p>這個 Demo 採用簡化版的 KinectFusion 教學流程：8 台虛擬相機會沿著固定環狀位置輪流擷取深度圖，再把每次觀測轉成單幀 TSDF，接著融合進全域 TSDF，最後把最新的數值場提取成網格。</p>
                             <ol>
-                                <li><strong>Acquire Depth</strong>：目前的虛擬相機朝物體中心發射視線，記錄每條光線第一次撞到表面的深度。這一步會得到單幀深度圖與對應的點雲觀測。</li>
+                                <li><strong>Acquire Depth</strong>：目前輪到的虛擬相機朝物體中心發射視線，記錄每條光線第一次撞到表面的深度。這一步會得到單幀深度圖與對應的點雲觀測。</li>
                                 <li><strong>Generate TSDF</strong>：把目前幀的點雲寫入一個新的單幀 TSDF。畫面中的體素帶顯示這次觀測實際影響到哪些格子。</li>
                                 <li><strong>TSDF Fuse</strong>：把單幀 TSDF 以加權平均方式融合進持久的全域 TSDF。第一台相機只負責初始化全域 TSDF，之後的相機才會持續精煉它。</li>
                                 <li><strong>Marching Cubes</strong>：Marching Cubes 永遠對最新的 TSDF 執行，也就是第一台相機初始化出的全域 TSDF，或後續融合後的全域 TSDF。</li>
@@ -123,17 +123,19 @@
                         <div class="lang-en">
                             <ul>
                                 <li><strong>Camera pyramids + scan rays</strong>: indicate where observations come from and which directions are sampled.</li>
-                                <li><strong>Red points</strong>: discrete surface samples reconstructed from depth images, including synthetic measurement noise.</li>
-                                <li><strong>Yellow voxels</strong>: cells that fall inside the truncation neighborhood of the points and therefore participate in fusion.</li>
-                                <li><strong>Blue mesh</strong>: the final zero-isosurface extracted from the fused field.</li>
+                                <li><strong>Red points</strong>: the current observation's depth map back-projected into 3D.</li>
+                                <li><strong>Frame voxels</strong>: the voxels touched by the current observation and used to build the current frame TSDF.</li>
+                                <li><strong>Global voxels</strong>: the voxels that already exist in the fused global TSDF after Step 3.</li>
+                                <li><strong>Blue mesh</strong>: the zero-isosurface extracted from the latest TSDF after Marching Cubes and optional weight-threshold filtering.</li>
                             </ul>
                         </div>
                         <div class="lang-zh hidden">
                             <ul>
                                 <li><strong>相機金字塔與掃描射線</strong>：表示觀測是從哪裡來，以及目前取樣的方向。</li>
-                                <li><strong>紅色點雲</strong>：由深度圖回投影得到的離散表面樣本，其中包含刻意加入的雜訊與離群點。</li>
-                                <li><strong>黃色體素</strong>：落在點雲截斷鄰域內、因此會參與融合計算的格子。</li>
-                                <li><strong>藍色網格</strong>：從融合後數值場提取出的最終零等值面。</li>
+                                <li><strong>紅色點雲</strong>：目前這次觀測從深度圖回投影得到的 3D 點雲。</li>
+                                <li><strong>Frame voxels</strong>：被目前觀測觸及、用來建立這一幀 frame TSDF 的體素。</li>
+                                <li><strong>Global voxels</strong>：在 Step 3 之後，已經存在於融合後 global TSDF 裡的體素。</li>
+                                <li><strong>藍色網格</strong>：對最新 TSDF 執行 Marching Cubes，並套用可選權重門檻後提取出的零等值面。</li>
                             </ul>
                         </div>
                     </section>
@@ -141,8 +143,8 @@
                     <section>
                         <h3 class="lang-en">6. Why Noise and Outliers Matter</h3>
                         <h3 class="lang-zh hidden">6. 為什麼雜訊與離群點很重要</h3>
-                        <p class="lang-en">Real sensors and learned renderers are imperfect: depths jitter, normals are approximate, and some samples are simply wrong. TSDF fusion is useful because it converts many noisy local observations into a smoother global field. If enough observations agree, the zero crossing stays stable even when individual samples are messy.</p>
-                        <p class="lang-zh hidden">真實感測器與學習式渲染器都不完美：深度會抖動、法向量只是近似、有些樣本甚至完全錯誤。TSDF 融合的價值就在於，它能把大量局部且帶噪的觀測整合成更平滑的全域數值場。只要足夠多的觀測彼此一致，零交叉面就能保持穩定，不會被單一錯誤樣本主導。</p>
+                        <p class="lang-en">This refactor no longer injects random free-floating outlier points. Point clouds now come only from each observation camera's depth observation of the gaussian splat scene. The remaining noise is measurement noise: back-projected points can still jitter slightly, and splat geometry itself can be imperfect when Splat Noise is high. TSDF fusion helps because repeated observations average those local errors into a smoother global field.</p>
+                        <p class="lang-zh hidden">這次重構後，系統不再額外注入隨機漂浮的 outlier 點。現在的點雲只來自每次觀測相機對 gaussian splat 場景的深度觀測。剩下的雜訊主要是量測雜訊：回投影的點仍可能有些微抖動，而當 Splat Noise 很高時，splat 幾何本身也可能不完美。TSDF 融合的作用就在於把這些局部誤差透過多次觀測平均成更平滑的全域數值場。</p>
                     </section>
 
                     <section>
@@ -150,6 +152,9 @@
                         <h3 class="lang-zh hidden">7. GUI 參數說明</h3>
 
                         <div class="lang-en">
+                            <h4>Observation Count</h4>
+                            <p>How many total observation steps Auto Play will run. The scene still contains 8 fixed virtual cameras; Auto Play cycles through them in order. For example, 800 observations means 100 full laps around the same 8 cameras.</p>
+
                             <h4>Grid Resolution</h4>
                             <p>The <em>N</em> in the shared N×N×N voxel grid used by voxelization, TSDF fusion, and Marching Cubes. All three steps must use the same grid, so this is a top-level setting.</p>
                             <p>Since the world space spans $[-2, 2]^3$ (extent = 2.0), voxel size is: $$\text{voxelSize} = \frac{2 \times \text{extent}}{N} = \frac{4}{N}$$The GUI shows the current voxel size as a read-only field (↳ Voxel Size) directly below the slider.</p>
@@ -181,21 +186,30 @@
                                         <li>Smaller μ → sharper surfaces, but gaps may appear where surface coverage is thin.</li>
                                     </ul>
                                 </li>
-                                <li><strong>Observation Weight (Steps 2–3)</strong>: The per-point weight $w_i$ in the weighted average
+                                <li><strong>Observation Weight (Step 3)</strong>: The per-frame weight used when the current frame TSDF is fused into the global TSDF.
                                     $$D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$$
-                                    Higher values make each new observation dominate the running average more. In this demo every gaussian point is fused exactly once, so changing this parameter uniformly scales all contributions — the relative effect on the final SDF is minimal. In a real incremental system (e.g. KinectFusion), a higher weight would let new depth frames correct the field faster, but would also amplify the influence of outlier points.
+                                    In the current implementation, a single frame first collapses all same-frame hits inside one voxel into one average distance, so each voxel in a frame TSDF has weight at most 1. This slider controls how strongly that frame contributes when merged into the global TSDF.
                                 </li>
                                 <li><strong>Max TSDF Weight (Step 3)</strong>: Cap on the cumulative weight $W_i$, i.e. <code>W_i = min(W_{i-1} + w_i, maxWeight)</code>. This prevents early observations from permanently dominating the average as more frames arrive.
                                     <ul>
                                         <li><strong>Lower cap</strong>: the field stays responsive to new data — useful in dynamic scenes where surfaces move.</li>
                                         <li><strong>Higher cap</strong>: the field converges more confidently as observations accumulate, but reacts slowly to corrections.</li>
-                                        <li><em>Note:</em> In this demo the point cloud is fused in a single pass, so each voxel is only observed once. The weight cap is never reached and this parameter has no visible effect. It becomes meaningful when the same scene is scanned multiple times (incremental fusion).</li>
+                                        <li><em>Note:</em> This parameter matters only in the global TSDF. Frame TSDF voxels are clamped to one observation per frame by design.</li>
+                                    </ul>
+                                </li>
+                                <li><strong>MC Weight Threshold (Step 4)</strong>: Filters the field before Marching Cubes. Cells with insufficient TSDF support are suppressed so low-confidence fragments are less likely to appear as mesh.
+                                    <ul>
+                                        <li><strong>Lower threshold</strong>: keeps more surface detail, but also keeps more weakly supported fragments.</li>
+                                        <li><strong>Higher threshold</strong>: removes more small noisy components, but may also erase thin or newly observed structures.</li>
                                     </ul>
                                 </li>
                             </ul>
                         </div>
 
                         <div class="lang-zh hidden">
+                            <h4>Observation Count</h4>
+                            <p>控制 Auto Play 總共要跑幾次觀測。場景中的虛擬相機仍固定是 8 台；Auto Play 只是依序重複使用這 8 台相機。因此若設定為 800，就代表沿著同一圈 8 台相機總共跑 100 圈。</p>
+
                             <h4>Grid Resolution</h4>
                             <p>三個步驟共用的 N×N×N 體素格子的邊長 N。體素化、TSDF 融合、Marching Cubes 三者必須使用同一個格子，因此這是頂層共享參數。</p>
                             <p>場景世界空間範圍為 $[-2, 2]^3$（extent = 2.0），因此 voxel 大小為：$$\text{voxelSize} = \frac{2 \times \text{extent}}{N} = \frac{4}{N}$$控制面板在 Resolution 滑桿正下方有 ↳ Voxel Size 唯讀欄位，即時顯示目前的格子大小。</p>
@@ -227,15 +241,21 @@
                                         <li>μ 越小 → 表面越銳利，但若點雲覆蓋率不足，可能出現破洞。</li>
                                     </ul>
                                 </li>
-                                <li><strong>Observation Weight（Steps 2–3）</strong>：加權平均公式
+                                <li><strong>Observation Weight（Step 3）</strong>：把目前 frame TSDF 融合進 global TSDF 時所使用的每幀權重。
                                     $$D_i = \frac{W_{i-1}D_{i-1} + w_i d_i}{W_{i-1} + w_i}$$
-                                    中每個點的單次觀測權重 $w_i$。數值越高，新觀測對目前均值的主導力越強。在本 demo 中每個 gaussian 點只融合一次，調整此參數等比縮放所有點的貢獻，對最終 SDF 的相對影響有限。在真實的增量式系統（如 KinectFusion）中，較高的權重讓新深度幀能更快修正數值場，但也會放大離群點的影響。
+                                    在目前實作中，單一 frame 會先把落在同一 voxel 的同幀觀測平均成一個距離值，因此 frame TSDF 裡每個 voxel 的 weight 最多只有 1。這個參數控制的是「這一整幀」在 Step 3 融合進 global TSDF 時的影響力。
                                 </li>
                                 <li><strong>Max TSDF Weight（Step 3）</strong>：累積權重 $W_i$ 的上限，即 <code>W_i = min(W_{i-1} + w_i, maxWeight)</code>，防止早期觀測隨著幀數增加而永遠主導均值。
                                     <ul>
                                         <li><strong>上限較低</strong>：數值場持續對新資料保持響應——適合動態場景或表面有移動的情況。</li>
                                         <li><strong>上限較高</strong>：觀測累積後收斂更穩定，但對後續修正的反應較慢。</li>
-                                        <li><em>注意：</em>本 demo 的點雲是單次全量融合，每個體素最多只被觀測一次，權重上限永遠不會被觸及，因此此參數在 demo 中沒有可見效果。在同一場景被重複掃描（增量式融合）時才會發揮作用。</li>
+                                        <li><em>注意：</em>這個上限只影響 global TSDF。frame TSDF 在設計上每個 voxel 每幀最多只會得到一次觀測權重。</li>
+                                    </ul>
+                                </li>
+                                <li><strong>MC Weight Threshold（Step 4）</strong>：在 Marching Cubes 前先過濾低支撐度的體素欄位，降低低權重碎片直接長成 mesh 的機率。
+                                    <ul>
+                                        <li><strong>門檻較低</strong>：能保留更多表面細節，但也較容易留下弱支撐的碎片。</li>
+                                        <li><strong>門檻較高</strong>：能去除更多小型雜點，但也可能讓薄片或剛被觀測到的結構一起消失。</li>
                                     </ul>
                                 </li>
                             </ul>
