@@ -22,28 +22,50 @@ This is a browser-only, zero-build educational visualization of **TSDF (Truncate
 
 ### Thread Model
 
-- **Main thread** (`src/main.js`): Three.js scene, lil-gui controls, OrbitControls, UI state
+- **Main thread** (`src/main.js`): Three.js scene, lil-gui controls, OrbitControls, UI state, auto-play orchestration
 - **Web Worker** (`src/worker.js`): All CPU-bound TSDF computation — never block the main thread with fusion logic
 
-Communication is via `postMessage`. Worker messages: `init`, `step1_generate`, `step2_voxelize`, `step3_fuse`, `step4_extract`, `reset`.
+Communication is via `postMessage`. Main → Worker messages:
 
-### 4-Step Pipeline
+| Message | Purpose |
+|---------|---------|
+| `init` | Initialize volume and scene config |
+| `acquire_depth` | Render depth map from camera at `cameraIndex` |
+| `update_gaussians` | Update Gaussian splat scene data |
+| `generate_tsdf` | Build per-frame TSDF from current depth map |
+| `fuse_tsdf` | Fuse frame TSDF into global TSDF |
+| `extract_mesh` | Run Marching Cubes on latest volume |
+| `reset` | Reset all runtime state |
 
-Each step maps to a GUI button and a worker message:
+Worker → Main replies use mirrored type names: `ready`, `depth_acquired`, `gaussians_updated`, `frame_tsdf_generated`, `tsdf_fused`, `mesh_ready`, `reset_done`.
 
-| Step | Button | Worker Op | Visualization |
-|------|--------|-----------|---------------|
-| 1 | Generate Points | `step1_generate` | Red point cloud |
-| 2 | Voxelize | `step2_voxelize` | Yellow voxels |
-| 3 | Fuse | `step3_fuse` | Progressive fusion + slicing plane heatmap |
-| 4 | Extract Mesh | `step4_extract` | Marching Cubes mesh (frost blue) |
+### Observation Pipeline
 
-Step 3 uses 500-point chunks with 80ms async yields to keep UI responsive during fusion.
+The demo simulates **8 cameras** arranged in a ring (radius 2.5, height 1.0, FOV 45°). Each observation:
+1. Acquires a 48×48 depth map (`DEPTH_RES = 48`) via ray-casting against the scene
+2. Back-projects to a point cloud with Gaussian measurement noise
+3. Builds a per-frame TSDF, then fuses it into the global TSDF
+
+The UI exposes auto-play (sequential observation loop) and a manual "Next Step" button. `fastForward` mode skips per-step rendering delays.
+
+### Scene Types
+
+Two built-in analytic surfaces: **sphere** and **torus**. The worker supports an alternative **Gaussian splat** input path (`gaussianPoints`): if provided, depth maps are rendered by splatting Gaussian centres instead of ray-casting the analytic surface.
 
 ### Core Data Structures
 
-- **`TSDFVolume`** (`src/tsdf.js`): 1D `Float32Array` for both `distances` and `weights`, indexed as `ix + iy*size + iz*size²`. Algorithm follows Curless & Levoy (1996) weighted averaging.
-- **`SurfaceSampler`** (`src/sampling.js`): Generates synthetic point clouds (sphere/torus) as `Float32Array([x,y,z, nx,ny,nz, weight, ...])`.
+- **`TSDFVolume`** (`src/tsdf.js`): 1D `Float32Array` for both `distances` (init 1.0) and `weights` (init 0.0), indexed as `ix + iy*size + iz*size²`. Algorithm follows Curless & Levoy (1996) weighted averaging. Has `.clone()`, `.reset()`, `.copyFrom()`, `.buildFrame()`, `.fuseVolume()`.
+- **`SurfaceSampler`** (`src/sampling.js`): Legacy helper — generates random point clouds for sphere/torus. The worker now primarily uses ray-cast depth maps rather than `SurfaceSampler`.
+
+### Key Constants (must stay in sync between main.js and worker.js)
+
+```js
+CAM_COUNT = 8
+CAM_RADIUS = 2.5
+CAM_HEIGHT = 1.0
+CAM_FOV_DEG = 45
+DEPTH_RES = 48   // exported from worker.js
+```
 
 ### Module Loading
 
@@ -59,3 +81,6 @@ Local modules under `src/` use relative ESM imports.
 - **Knowledge modal**: Bilingual EN/ZH toggle. KaTeX re-renders on language switch.
 - **Nord color theme**: `style.css` uses the Nord palette throughout — keep new UI consistent with it.
 - **Slicing plane**: Renders a 2D TSDF cross-section with a heatmap colormap; driven by a GUI slider for Z position.
+- **Voxel tooltip**: Hover interaction on voxels shows TSDF value/weight.
+- **Observation counter**: `observationProgressText` tracks current / total observations in the GUI.
+- **Indentation**: 4 spaces (JS, CSS, HTML) — matches AGENTS.md and existing source files.
