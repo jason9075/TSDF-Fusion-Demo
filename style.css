@@ -82,6 +82,10 @@ header p {
     height: 100%;
 }
 
+#status p {
+    margin: 0;
+}
+
 #status {
     position: absolute;
     bottom: 2rem;

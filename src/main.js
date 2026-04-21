@@ -26,6 +26,7 @@ const params = {
     showKnowledge: () => toggleModal(true),
     cameraZoom: 4, // initial distance = length of (3,3,3)
     observationCount: 8,
+    observationProgressText: 'Observation 0 / 8',
     fastForward: false,
     type: 'sphere',
 
@@ -56,6 +57,7 @@ const workerResolvers = new Map(); // type → resolve, for async worker communi
 // gaussians: -1 = hide all, 'all' = show all sectors, 0–7 = show specific sector
 const stepWants = { gaussians: 'all', points: true, frameVoxels: false, globalVoxels: false, mesh: false, camera: true };
 const visibilityControllers = {};
+let observationProgressCtrl = null;
 
 // Accumulated point positions from all previously completed cameras (auto-play only)
 let accumulatedPointPositions = null;
@@ -260,6 +262,13 @@ function renderGaussianSectorPoints(cameraIndex) {
     renderRawPoints(rawPoints);
     pendingPoints = null;
     applyVis();
+}
+
+function regenerateGaussianScene() {
+    gaussianClouds.forEach(m => scene.remove(m));
+    gaussianClouds = createGaussianCloud(params.type);
+    gaussianClouds.forEach(m => scene.add(m));
+    highlightCamera(activeCameraIndex);
 }
 
 function renderRawPoints(rawPoints) {
@@ -811,6 +820,7 @@ function setupGUI() {
     tsdfFolder.add(params, 'mcWeightThreshold', 1, 8, 1).name('MC Weight Threshold');
 
     const steps = gui.addFolder('Steps');
+    observationProgressCtrl = steps.add(params, 'observationProgressText').name('Observation').disable();
     const stepCtrls = [
         steps.add(params, 'step1').name('1. Acquire Depth'),
         steps.add(params, 'step2').name('2. Generate TSDF'),
@@ -880,6 +890,10 @@ function initWorker() {
                 updateStatus(`Step 1 Complete: Camera ${cameraIndex + 1} depth captured. Run Step 2 to build the frame TSDF.`);
                 break;
             }
+
+            case 'gaussians_updated':
+                resolveWorker('gaussians_updated', data);
+                break;
 
             case 'frame_tsdf_generated':
                 activeCameraIndex = data.cameraIndex;
@@ -1652,6 +1666,19 @@ async function startAutoPlay() {
             showGlobalVoxels: false,
             showMesh: false,
         });
+        regenerateGaussianScene();
+        const waitForGaussiansUpdated = waitForWorkerMsg('gaussians_updated');
+        worker.postMessage({
+            type: 'update_gaussians',
+            data: {
+                type: params.type,
+                noise: params.noise,
+                gsplatNoise: params.gsplatNoise,
+                gaussianPoints: getGaussianRawPoints(),
+            },
+        });
+        await waitForGaussiansUpdated;
+        await checkPause();
         addSector(c);
         renderGaussianSectorPoints(c);
         clearScanRays();
@@ -1798,9 +1825,8 @@ function updateStatus(msg) {
 }
 
 function updatePlaybackInfo(currentObservation, totalObservations) {
-    const info = document.getElementById('playback-info');
-    if (!info) return;
-    info.textContent = `Observation ${currentObservation} / ${totalObservations}`;
+    params.observationProgressText = `Observation ${currentObservation} / ${totalObservations}`;
+    observationProgressCtrl?.updateDisplay();
 }
 
 function onWindowResize() {

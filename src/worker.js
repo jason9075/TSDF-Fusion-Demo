@@ -45,6 +45,11 @@ self.onmessage = (e) => {
             });
             break;
 
+        case 'update_gaussians':
+            updateGaussianScene(data);
+            self.postMessage({ type: 'gaussians_updated' });
+            break;
+
         case 'generate_tsdf':
             ensureObservations();
             updateConfig(data);
@@ -189,6 +194,17 @@ function updateConfig(config = {}) {
     }
 
     if (config.observationWeight !== undefined) observationWeight = config.observationWeight;
+}
+
+function updateGaussianScene(data = {}) {
+    sceneType = data.type || sceneType;
+    noiseStd = data.noise ?? noiseStd;
+    gsplatNoiseScale = data.gsplatNoise ?? gsplatNoiseScale;
+    gaussianPoints = data.gaussianPoints ?? gaussianPoints;
+    cameraPoints = null;
+    cameraDepthMaps = null;
+    framePoints = null;
+    frameDepthMap = null;
 }
 
 function ensureObservations() {
