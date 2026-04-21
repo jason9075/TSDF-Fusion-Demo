@@ -11,19 +11,20 @@ const params = {
     resolution: 64,
     muVoxels: 4,
     observationWeight: 1.0,
-    maxTSDFWeight: 32,
+    maxTSDFWeight: 8,
+    mcWeightThreshold: 2,
     noise: 0.05,
-    outliers: 0.02,
     gaussianCount: 500,
     gsplatNoise: 0.5,
     showGaussians: true,
     showPoints: true,
-    showVoxels: true,
+    showFrameVoxels: true,
+    showGlobalVoxels: true,
     showMesh: true,
     showCamera: true,
     showGrids: true,
     showKnowledge: () => toggleModal(true),
-    cameraZoom: 5.2, // initial distance = length of (3,3,3)
+    cameraZoom: 4, // initial distance = length of (3,3,3)
     currentCamera: 1,
     type: 'sphere',
 
@@ -36,11 +37,12 @@ const params = {
 };
 
 let scene, camera, renderer, controls;
-let marchingCubes, marchingWireframe, pointCloud, voxelCloud;
+let marchingCubes, marchingWireframe, pointCloud, frameVoxelCloud, globalVoxelCloud;
 let gaussianClouds = [];
 let gridHelper = null;
 let cameraHelpers = [];
 let scanLines = []; // animated rays during step 1
+let voxelTooltip = null;
 
 // Auto-play state
 const autoPlayState = { playing: false, paused: false };
@@ -49,7 +51,7 @@ const workerResolvers = new Map(); // type → resolve, for async worker communi
 
 // What the current step/play WANTS to show — independent of user toggle permissions.
 // gaussians: -1 = hide all, 'all' = show all sectors, 0–7 = show specific sector
-const stepWants = { gaussians: 'all', points: true, voxels: false, mesh: false, camera: true };
+const stepWants = { gaussians: 'all', points: true, frameVoxels: false, globalVoxels: false, mesh: false, camera: true };
 const visibilityControllers = {};
 
 // Accumulated point positions from all previously completed cameras (auto-play only)
@@ -59,11 +61,19 @@ let worker;
 let workerNeedsInit = true;
 let currentStep = 0;
 let distancesBuffer = null;
+let weightsBuffer = null;
 let pendingPoints = null;
 let activeDepthMap = null;
 let activeCameraIndex = 0;
 let frameDistancesBuffer = null;
 let globalDistancesBuffer = null;
+let frameWeightsBuffer = null;
+let globalWeightsBuffer = null;
+
+const raycaster = new THREE.Raycaster();
+const pointerNdc = new THREE.Vector2(2, 2);
+const pointerScreen = { x: 0, y: 0, active: false };
+let hoveredVoxel = null;
 
 const POINT_REVEAL_DURATION_MS = 1100;
 const VOXEL_REVEAL_DURATION_MS = 850;
@@ -420,7 +430,7 @@ init();
 function init() {
     scene = new THREE.Scene();
     camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    camera.position.set(3, 3, 3);
+    camera.position.set(2, 2, 2);
 
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -509,9 +519,17 @@ function init() {
         transparent: true,
         opacity: 0.4
     });
-    voxelCloud = new THREE.Points(new THREE.BufferGeometry(), voxelMaterial);
-    voxelCloud.visible = false;
-    scene.add(voxelCloud);
+    frameVoxelCloud = new THREE.Points(new THREE.BufferGeometry(), voxelMaterial.clone());
+    frameVoxelCloud.visible = false;
+    scene.add(frameVoxelCloud);
+
+    globalVoxelCloud = new THREE.Points(new THREE.BufferGeometry(), voxelMaterial.clone());
+    globalVoxelCloud.visible = false;
+    scene.add(globalVoxelCloud);
+
+    voxelTooltip = document.createElement('div');
+    voxelTooltip.className = 'voxel-tooltip hidden';
+    document.body.appendChild(voxelTooltip);
 
     setupGUI();
     initWorker();
@@ -524,6 +542,8 @@ function init() {
     });
 
     window.addEventListener('resize', onWindowResize);
+    renderer.domElement.addEventListener('pointermove', onPointerMove);
+    renderer.domElement.addEventListener('pointerleave', onPointerLeave);
     animate();
 }
 
@@ -592,11 +612,11 @@ function stopVoxelReveal({ showAll = true } = {}) {
     voxelRevealState.active = false;
     voxelRevealState.startTime = 0;
     if (showAll && voxelRevealState.totalPoints > 0) {
-        voxelCloud.geometry.setDrawRange(0, voxelRevealState.totalPoints);
+        frameVoxelCloud.geometry.setDrawRange(0, voxelRevealState.totalPoints);
         voxelRevealState.currentCount = voxelRevealState.totalPoints;
     }
-    voxelCloud.material.opacity = params.showVoxels ? 0.4 : voxelCloud.material.opacity;
-    voxelCloud.material.size = 0.03;
+    frameVoxelCloud.material.opacity = params.showFrameVoxels ? 0.4 : frameVoxelCloud.material.opacity;
+    frameVoxelCloud.material.size = 0.03;
 }
 
 function stopVoxelIntegration({ preserveColors = false } = {}) {
@@ -604,9 +624,9 @@ function stopVoxelIntegration({ preserveColors = false } = {}) {
     voxelIntegrationState.progress = 0;
     voxelIntegrationState.pulsePhase = 0;
     if (!preserveColors) {
-        voxelCloud.material.color.setHex(0xebcb8b);
-        voxelCloud.material.opacity = params.showVoxels ? 0.4 : voxelCloud.material.opacity;
-        voxelCloud.material.size = 0.03;
+        globalVoxelCloud.material.color.setHex(0xebcb8b);
+        globalVoxelCloud.material.opacity = params.showGlobalVoxels ? 0.4 : globalVoxelCloud.material.opacity;
+        globalVoxelCloud.material.size = 0.03;
     }
 }
 
@@ -616,8 +636,8 @@ function stopVoxelIntegration({ preserveColors = false } = {}) {
  *   near-black = unobserved (d ≈ 1.0)
  * PointsMaterial has no per-vertex alpha, so brightness encodes importance.
  */
-function updateVoxelColors(distances) {
-    const posAttr = voxelCloud.geometry.attributes.position;
+function updateVoxelColors(targetCloud, distances) {
+    const posAttr = targetCloud.geometry.attributes.position;
     if (!posAttr) return;
 
     const N = posAttr.count;
@@ -664,20 +684,20 @@ function updateVoxelColors(distances) {
         colorData[i * 3 + 2] = b;
     }
 
-    voxelCloud.geometry.setAttribute('color', new THREE.BufferAttribute(colorData, 3));
-    voxelCloud.material.vertexColors = true;
-    voxelCloud.material.color.set(0xffffff); // must be white so it doesn't tint vertex colors
-    voxelCloud.material.opacity = 0.80;
-    voxelCloud.material.size = 0.042;
-    voxelCloud.material.needsUpdate = true;
+    targetCloud.geometry.setAttribute('color', new THREE.BufferAttribute(colorData, 3));
+    targetCloud.material.vertexColors = true;
+    targetCloud.material.color.set(0xffffff);
+    targetCloud.material.opacity = 0.80;
+    targetCloud.material.size = 0.042;
+    targetCloud.material.needsUpdate = true;
 }
 
 function updateVoxelIntegration(progress) {
     voxelIntegrationState.active = progress < 1;
     voxelIntegrationState.progress = progress;
-    voxelCloud.material.opacity = 0.22 + progress * 0.28;
-    voxelCloud.material.size = 0.03 + progress * 0.012;
-    voxelCloud.material.color.setRGB(
+    globalVoxelCloud.material.opacity = 0.22 + progress * 0.28;
+    globalVoxelCloud.material.size = 0.03 + progress * 0.012;
+    globalVoxelCloud.material.color.setRGB(
         0.92 + progress * 0.08,
         0.80 + progress * 0.14,
         0.30 + progress * 0.18,
@@ -688,7 +708,7 @@ function setupGUI() {
     const gui = new GUI();
     
     gui.add(params, 'showKnowledge').name('💡 Knowledge Base');
-    gui.add(params, 'cameraZoom', 0.8, 6, 0.1).name('🔍 Zoom').onChange(v => {
+    gui.add(params, 'cameraZoom', 0.8, 5, 0.1).name('🔍 Zoom').onChange(v => {
         const offset = new THREE.Vector3().subVectors(camera.position, controls.target);
         offset.setLength(v);
         camera.position.copy(controls.target).add(offset);
@@ -782,8 +802,9 @@ function setupGUI() {
     // --- TSDF Volume (Generate + Fuse params) ---
     const tsdfFolder = gui.addFolder('TSDF Volume (Steps 2–3)');
     tsdfFolder.add(params, 'muVoxels', 1, 10, 0.5).name('Truncation μ');
-    tsdfFolder.add(params, 'observationWeight', 0.1, 4.0, 0.1).name('Observation Weight');
-    tsdfFolder.add(params, 'maxTSDFWeight', 1, 128, 1).name('Max TSDF Weight');
+    tsdfFolder.add(params, 'observationWeight', 0.1, 2.0, 0.1).name('Observation Weight');
+    tsdfFolder.add(params, 'maxTSDFWeight', 1, 8, 1).name('Max TSDF Weight');
+    tsdfFolder.add(params, 'mcWeightThreshold', 2, 8, 1).name('MC Weight Threshold');
 
     const steps = gui.addFolder('Steps');
     const stepCtrls = [
@@ -810,14 +831,17 @@ function setupGUI() {
         .onChange(() => applyVis());
     const ctrlPoints = view.add(params, 'showPoints').name('Show Points')
         .onChange(() => applyVis());
-    const ctrlVoxels = view.add(params, 'showVoxels').name('Show Voxels')
+    const ctrlFrameVoxels = view.add(params, 'showFrameVoxels').name('Show Frame Voxels')
+        .onChange(() => applyVis());
+    const ctrlGlobalVoxels = view.add(params, 'showGlobalVoxels').name('Show Global Voxels')
         .onChange(() => applyVis());
     const ctrlMesh = view.add(params, 'showMesh').name('Show Mesh')
         .onChange(() => applyVis());
     visibilityControllers.showGaussians = ctrlGaussians;
     visibilityControllers.showCamera = ctrlCamera;
     visibilityControllers.showPoints = ctrlPoints;
-    visibilityControllers.showVoxels = ctrlVoxels;
+    visibilityControllers.showFrameVoxels = ctrlFrameVoxels;
+    visibilityControllers.showGlobalVoxels = ctrlGlobalVoxels;
     visibilityControllers.showMesh = ctrlMesh;
 
 
@@ -855,9 +879,11 @@ function initWorker() {
             case 'frame_tsdf_generated':
                 activeCameraIndex = data.cameraIndex;
                 frameDistancesBuffer = data.distances;
+                frameWeightsBuffer = data.weights;
                 distancesBuffer = data.distances;
-                renderVoxels(data.voxelCenters);
-                updateVoxelColors(data.distances);
+                weightsBuffer = data.weights;
+                renderVoxels(frameVoxelCloud, data.voxelCenters);
+                updateVoxelColors(frameVoxelCloud, data.distances);
                 markStepComplete(2, { nextStep: 3 });
                 resolveWorker('frame_tsdf_generated', data);
                 console.debug('frame_tsdf_generated', data.debug);
@@ -870,8 +896,11 @@ function initWorker() {
             case 'tsdf_fused':
                 activeCameraIndex = data.cameraIndex;
                 globalDistancesBuffer = data.distances;
+                globalWeightsBuffer = data.weights;
                 distancesBuffer = data.distances;
-                updateVoxelColors(data.distances);
+                weightsBuffer = data.weights;
+                renderVoxels(globalVoxelCloud, data.voxelCenters, { animate: false });
+                updateVoxelColors(globalVoxelCloud, data.distances);
                 stopVoxelIntegration({ preserveColors: true });
                 markStepComplete(3, { nextStep: 4 });
                 resolveWorker('tsdf_fused', data);
@@ -898,7 +927,9 @@ function initWorker() {
                 resetManualProgress();
                 accumulatedPointPositions = null;
                 globalDistancesBuffer = null;
+                globalWeightsBuffer = null;
                 distancesBuffer = null;
+                weightsBuffer = null;
                 workerNeedsInit = true;
                 clearPointCloud();
                 stopPointReveal({ showAll: false });
@@ -913,7 +944,8 @@ function initWorker() {
                 setVis('gaussians', true);
                 setVis('camera', true);
                 setVis('points', true);
-                setVis('voxels', false);
+                setVis('frameVoxels', false);
+                setVis('globalVoxels', false);
                 setVis('mesh', false);
                 cameraHelpers.forEach(h => {
                     if (h.depthCtx) {
@@ -950,9 +982,8 @@ function applyVis() {
         const pointCount = pointCloud.geometry.attributes.position?.count ?? 0;
         pointCloud.visible = params.showPoints && stepWants.points && pointCount > 0;
     }
-    if (voxelCloud) {
-        voxelCloud.visible = params.showVoxels && stepWants.voxels;
-    }
+    if (frameVoxelCloud) frameVoxelCloud.visible = params.showFrameVoxels && stepWants.frameVoxels;
+    if (globalVoxelCloud) globalVoxelCloud.visible = params.showGlobalVoxels && stepWants.globalVoxels;
     if (marchingCubes) {
         marchingCubes.visible = params.showMesh && stepWants.mesh;
     }
@@ -981,19 +1012,22 @@ function setManualVisibilityState({
     showGaussians = params.showGaussians,
     showCamera = params.showCamera,
     showPoints = params.showPoints,
-    showVoxels = params.showVoxels,
+    showFrameVoxels = params.showFrameVoxels,
+    showGlobalVoxels = params.showGlobalVoxels,
     showMesh = params.showMesh,
 } = {}) {
     stepWants.gaussians = 'all';
     stepWants.camera = true;
     stepWants.points = true;
-    stepWants.voxels = true;
+    stepWants.frameVoxels = true;
+    stepWants.globalVoxels = true;
     stepWants.mesh = true;
 
     setVisibilityToggle('showGaussians', showGaussians);
     setVisibilityToggle('showCamera', showCamera);
     setVisibilityToggle('showPoints', showPoints);
-    setVisibilityToggle('showVoxels', showVoxels);
+    setVisibilityToggle('showFrameVoxels', showFrameVoxels);
+    setVisibilityToggle('showGlobalVoxels', showGlobalVoxels);
     setVisibilityToggle('showMesh', showMesh);
     applyVis();
 }
@@ -1086,8 +1120,12 @@ function resetManualProgress() {
     pendingPoints = null;
     activeDepthMap = null;
     frameDistancesBuffer = null;
+    frameWeightsBuffer = null;
     distancesBuffer = globalDistancesBuffer;
+    weightsBuffer = globalWeightsBuffer;
     activeCameraIndex = params.currentCamera - 1;
+    hoveredVoxel = null;
+    hideVoxelTooltip();
 }
 
 function clearPointCloud() {
@@ -1095,6 +1133,168 @@ function clearPointCloud() {
     pointCloud.geometry.setDrawRange(0, 0);
     stopPointReveal({ showAll: false });
     pendingPoints = null;
+}
+
+function hideVoxelTooltip() {
+    voxelTooltip?.classList.add('hidden');
+}
+
+function onPointerMove(event) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    pointerScreen.x = event.clientX;
+    pointerScreen.y = event.clientY;
+    pointerNdc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    pointerNdc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    pointerScreen.active = true;
+}
+
+function onPointerLeave() {
+    pointerScreen.active = false;
+    pointerNdc.set(2, 2);
+    hoveredVoxel = null;
+    hideVoxelTooltip();
+}
+
+function updateVoxelHover() {
+    const candidates = [];
+    if (frameVoxelCloud.visible && frameDistancesBuffer && frameWeightsBuffer) {
+        candidates.push({
+            kind: 'frame',
+            cloud: frameVoxelCloud,
+            distances: frameDistancesBuffer,
+            weights: frameWeightsBuffer,
+        });
+    }
+    if (globalVoxelCloud.visible && globalDistancesBuffer && globalWeightsBuffer) {
+        candidates.push({
+            kind: 'global',
+            cloud: globalVoxelCloud,
+            distances: globalDistancesBuffer,
+            weights: globalWeightsBuffer,
+        });
+    }
+
+    if (!pointerScreen.active || candidates.length === 0) {
+        hoveredVoxel = null;
+        hideVoxelTooltip();
+        return;
+    }
+
+    raycaster.setFromCamera(pointerNdc, camera);
+    let bestHit = null;
+    for (const candidate of candidates) {
+        raycaster.params.Points.threshold = Math.max(0.12, candidate.cloud.material.size * 3.5);
+        const hit = raycaster.intersectObject(candidate.cloud, false)[0];
+        if (!hit || hit.index === undefined) continue;
+        if (!bestHit || hit.distance < bestHit.hit.distance) {
+            bestHit = { candidate, hit };
+        }
+    }
+
+    if (!bestHit) {
+        hoveredVoxel = null;
+        hideVoxelTooltip();
+        return;
+    }
+
+    const { candidate, hit } = bestHit;
+    const posAttr = candidate.cloud.geometry.attributes.position;
+    const wx = posAttr.getX(hit.index);
+    const wy = posAttr.getY(hit.index);
+    const wz = posAttr.getZ(hit.index);
+    const idx = getVoxelIndexFromWorld(wx, wy, wz);
+    if (idx < 0 || idx >= candidate.distances.length || idx >= candidate.weights.length) {
+        hoveredVoxel = null;
+        hideVoxelTooltip();
+        return;
+    }
+
+    hoveredVoxel = {
+        kind: candidate.kind,
+        world: [wx, wy, wz],
+        index: idx,
+        distance: candidate.distances[idx],
+        weight: candidate.weights[idx],
+        mcThreshold: params.mcWeightThreshold,
+        weightPassesThreshold: candidate.weights[idx] >= params.mcWeightThreshold,
+        mcCellEligible: hasEligibleMarchingCubesCell(idx, candidate.weights, params.resolution, params.mcWeightThreshold),
+    };
+    renderVoxelTooltip();
+}
+
+function getVoxelIndexFromWorld(wx, wy, wz) {
+    const extent = 2.0;
+    const size = params.resolution;
+    const voxelSize = (extent * 2) / size;
+    const ix = Math.floor((wx + extent) / voxelSize);
+    const iy = Math.floor((wy + extent) / voxelSize);
+    const iz = Math.floor((wz + extent) / voxelSize);
+    if (ix < 0 || ix >= size || iy < 0 || iy >= size || iz < 0 || iz >= size) return -1;
+    return ix + iy * size + iz * size * size;
+}
+
+function getVoxelCoordsFromIndex(idx, size) {
+    const sizeSq = size * size;
+    const iz = Math.floor(idx / sizeSq);
+    const iy = Math.floor((idx % sizeSq) / size);
+    const ix = idx % size;
+    return { ix, iy, iz };
+}
+
+function hasEligibleMarchingCubesCell(idx, weights, size, threshold) {
+    if (threshold <= 0) return true;
+
+    const { ix, iy, iz } = getVoxelCoordsFromIndex(idx, size);
+    for (let dz = -1; dz <= 0; dz++) {
+        for (let dy = -1; dy <= 0; dy++) {
+            for (let dx = -1; dx <= 0; dx++) {
+                const x = ix + dx;
+                const y = iy + dy;
+                const z = iz + dz;
+                if (x < 0 || y < 0 || z < 0 || x >= size - 1 || y >= size - 1 || z >= size - 1) continue;
+                if (cellPassesWeightThreshold(x, y, z, weights, size, threshold)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+function cellPassesWeightThreshold(x, y, z, weights, size, threshold) {
+    const sizeSq = size * size;
+    const i000 = x + y * size + z * sizeSq;
+    const i100 = i000 + 1;
+    const i010 = i000 + size;
+    const i110 = i010 + 1;
+    const i001 = i000 + sizeSq;
+    const i101 = i001 + 1;
+    const i011 = i001 + size;
+    const i111 = i011 + 1;
+    return weights[i000] >= threshold
+        && weights[i100] >= threshold
+        && weights[i010] >= threshold
+        && weights[i110] >= threshold
+        && weights[i001] >= threshold
+        && weights[i101] >= threshold
+        && weights[i011] >= threshold
+        && weights[i111] >= threshold;
+}
+
+function renderVoxelTooltip() {
+    if (!hoveredVoxel || !voxelTooltip) return;
+    const mu = getMu();
+    voxelTooltip.innerHTML = [
+        `kind: ${hoveredVoxel.kind}`,
+        `idx: ${hoveredVoxel.index}`,
+        `distance: ${hoveredVoxel.distance.toFixed(4)}`,
+        `weight: ${hoveredVoxel.weight.toFixed(2)}`,
+        `mc threshold: ${hoveredVoxel.mcThreshold.toFixed(2)}`,
+        `voxel passes: ${hoveredVoxel.weightPassesThreshold ? 'yes' : 'no'}`,
+        `mc cell eligible: ${hoveredVoxel.mcCellEligible ? 'yes' : 'no'}`,
+        `distance/mu: ${(hoveredVoxel.distance / mu).toFixed(3)}`,
+    ].join('<br>');
+    voxelTooltip.style.left = `${pointerScreen.x + 14}px`;
+    voxelTooltip.style.top = `${pointerScreen.y + 14}px`;
+    voxelTooltip.classList.remove('hidden');
 }
 
 function highlightStep(step) {
@@ -1163,7 +1363,8 @@ function triggerStep(step) {
             showGaussians: true,
             showCamera: true,
             showPoints: true,
-            showVoxels: false,
+            showFrameVoxels: false,
+            showGlobalVoxels: false,
             showMesh: false,
         });
         if (workerNeedsInit) sendInitToWorker();
@@ -1178,7 +1379,8 @@ function triggerStep(step) {
             showGaussians: false,
             showCamera: true,
             showPoints: true,
-            showVoxels: true,
+            showFrameVoxels: true,
+            showGlobalVoxels: false,
             showMesh: false,
         });
         renderPoints(pendingPoints);
@@ -1204,7 +1406,8 @@ function triggerStep(step) {
             showGaussians: false,
             showCamera: true,
             showPoints: true,
-            showVoxels: true,
+            showFrameVoxels: false,
+            showGlobalVoxels: true,
             showMesh: false,
         });
         voxelIntegrationState.active = true;
@@ -1231,10 +1434,11 @@ function triggerStep(step) {
             showGaussians: false,
             showCamera: false,
             showPoints: false,
-            showVoxels: false,
+            showFrameVoxels: false,
+            showGlobalVoxels: false,
             showMesh: true,
         });
-        worker.postMessage({ type: 'extract_mesh' });
+        worker.postMessage({ type: 'extract_mesh', data: { weightThreshold: params.mcWeightThreshold } });
     }
 }
 
@@ -1270,29 +1474,32 @@ function renderPoints(data, { accumulate = false } = {}) {
     pointRevealState.currentCount = prevCount;
 }
 
-function renderVoxels(data) {
-    voxelCloud.geometry.deleteAttribute('color');
-    voxelCloud.material.vertexColors = false;
-    voxelCloud.material.needsUpdate = true;
-    voxelCloud.geometry.setAttribute('position', new THREE.BufferAttribute(data, 3));
-    voxelCloud.geometry.setDrawRange(0, 0);
-    voxelCloud.material.opacity = 0.08;
-    voxelCloud.material.size = 0.055;
-    voxelCloud.material.color.setHex(0xebcb8b);
-    voxelRevealState.active = true;
-    voxelRevealState.startTime = performance.now();
-    voxelRevealState.totalPoints = data.length / 3;
-    voxelRevealState.currentCount = 0;
-    stopVoxelIntegration();
+function renderVoxels(targetCloud, data, { animate = true } = {}) {
+    targetCloud.geometry.deleteAttribute('color');
+    targetCloud.material.vertexColors = false;
+    targetCloud.material.needsUpdate = true;
+    targetCloud.geometry.setAttribute('position', new THREE.BufferAttribute(data, 3));
+    targetCloud.geometry.setDrawRange(0, animate ? 0 : data.length / 3);
+    targetCloud.material.opacity = 0.08;
+    targetCloud.material.size = 0.055;
+    targetCloud.material.color.setHex(0xebcb8b);
+
+    if (targetCloud === frameVoxelCloud) {
+        voxelRevealState.active = animate;
+        voxelRevealState.startTime = performance.now();
+        voxelRevealState.totalPoints = data.length / 3;
+        voxelRevealState.currentCount = animate ? 0 : data.length / 3;
+        stopVoxelIntegration();
+    }
 }
 
 function showActiveVoxelPreview() {
-    voxelCloud.geometry.deleteAttribute('color');
-    voxelCloud.material.vertexColors = false;
-    voxelCloud.material.needsUpdate = true;
-    voxelCloud.material.color.setHex(0xebcb8b);
-    voxelCloud.material.opacity = 0.4;
-    voxelCloud.material.size = 0.03;
+    frameVoxelCloud.geometry.deleteAttribute('color');
+    frameVoxelCloud.material.vertexColors = false;
+    frameVoxelCloud.material.needsUpdate = true;
+    frameVoxelCloud.material.color.setHex(0xebcb8b);
+    frameVoxelCloud.material.opacity = 0.4;
+    frameVoxelCloud.material.size = 0.03;
 }
 
 function renderMesh(distances) {
@@ -1375,7 +1582,8 @@ async function startAutoPlay() {
         showGaussians: false,
         showCamera: true,
         showPoints: true,
-        showVoxels: false,
+        showFrameVoxels: false,
+        showGlobalVoxels: false,
         showMesh: false,
     });
     clearScanRays();
@@ -1397,7 +1605,8 @@ async function startAutoPlay() {
             showGaussians: true,
             showCamera: true,
             showPoints: true,
-            showVoxels: false,
+            showFrameVoxels: false,
+            showGlobalVoxels: false,
             showMesh: false,
         });
         addSector(c);
@@ -1417,7 +1626,8 @@ async function startAutoPlay() {
             showGaussians: false,
             showCamera: true,
             showPoints: true,
-            showVoxels: true,
+            showFrameVoxels: true,
+            showGlobalVoxels: false,
             showMesh: false,
         });
         renderPoints(pendingPoints, { accumulate: false });
@@ -1450,7 +1660,8 @@ async function startAutoPlay() {
                 showGaussians: false,
                 showCamera: true,
                 showPoints: true,
-                showVoxels: true,
+                showFrameVoxels: false,
+                showGlobalVoxels: true,
                 showMesh: false,
             });
             voxelIntegrationState.active = true;
@@ -1494,11 +1705,12 @@ async function startAutoPlay() {
             showGaussians: false,
             showCamera: false,
             showPoints: false,
-            showVoxels: false,
+            showFrameVoxels: false,
+            showGlobalVoxels: false,
             showMesh: true,
         });
         const t4 = performance.now();
-        worker.postMessage({ type: 'extract_mesh' });
+        worker.postMessage({ type: 'extract_mesh', data: { weightThreshold: params.mcWeightThreshold } });
         await waitForWorkerMsg('mesh_ready');
         await waitWithStepProgress(4, AUTO_PLAY_STEP_HOLD_MS, t4, { nextStep: c < CAM_COUNT_MAIN - 1 ? 1 : 0 });
         cameraHelpers.forEach(h => {
@@ -1523,7 +1735,6 @@ function sendInitToWorker() {
             type: params.type,
             noise: params.noise,
             gsplatNoise: params.gsplatNoise,
-            outliers: params.outliers,
             // Pass gaussian positions so the worker can synthesize depth maps
             // from the gsplat distribution before back-projecting them.
             gaussianPoints: getGaussianRawPoints(),
@@ -1539,11 +1750,13 @@ function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    hideVoxelTooltip();
 }
 
 function animate() {
     requestAnimationFrame(animate);
     controls.update();
+    updateVoxelHover();
 
     // Grow scan rays toward their target (step 1 animation)
     for (const r of scanLines) {
@@ -1585,30 +1798,30 @@ function animate() {
         }
     }
 
-    if (voxelCloud.visible && voxelRevealState.active) {
+    if (frameVoxelCloud.visible && voxelRevealState.active) {
         const elapsed = performance.now() - voxelRevealState.startTime;
         const t = Math.min(1, elapsed / voxelRevealState.durationMs);
         const eased = easeOutCubic(t);
         const nextCount = Math.floor(voxelRevealState.totalPoints * eased);
 
         if (nextCount !== voxelRevealState.currentCount) {
-            voxelCloud.geometry.setDrawRange(0, nextCount);
+            frameVoxelCloud.geometry.setDrawRange(0, nextCount);
             voxelRevealState.currentCount = nextCount;
         }
 
-        voxelCloud.material.opacity = 0.08 + eased * 0.32;
-        voxelCloud.material.size = 0.055 - eased * 0.025;
+        frameVoxelCloud.material.opacity = 0.08 + eased * 0.32;
+        frameVoxelCloud.material.size = 0.055 - eased * 0.025;
 
         if (t >= 1) {
             stopVoxelReveal();
         }
     }
 
-    if (voxelCloud.visible && voxelIntegrationState.active) {
+    if (globalVoxelCloud.visible && voxelIntegrationState.active) {
         voxelIntegrationState.pulsePhase += 0.16;
         const pulse = 0.5 + 0.5 * Math.sin(voxelIntegrationState.pulsePhase);
-        voxelCloud.material.size = 0.036 + voxelIntegrationState.progress * 0.006 + pulse * 0.004;
-        voxelCloud.material.opacity = Math.max(voxelCloud.material.opacity, 0.30 + voxelIntegrationState.progress * 0.12 + pulse * 0.05);
+        globalVoxelCloud.material.size = 0.036 + voxelIntegrationState.progress * 0.006 + pulse * 0.004;
+        globalVoxelCloud.material.opacity = Math.max(globalVoxelCloud.material.opacity, 0.30 + voxelIntegrationState.progress * 0.12 + pulse * 0.05);
     }
 
     renderer.render(scene, camera);

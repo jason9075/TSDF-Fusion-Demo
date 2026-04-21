@@ -7,7 +7,6 @@ let latestVolumeKind = null;
 
 let sceneType = 'sphere';
 let noiseStd = 0.02;
-let outlierRate = 0.05;
 let observationWeight = 1.0;
 let gsplatNoiseScale = 1.0;
 let gaussianPoints = null;
@@ -71,8 +70,15 @@ self.onmessage = (e) => {
             const previousGlobal = globalVolume ? globalVolume.clone() : null;
             if (!globalVolume) {
                 globalVolume = frameVolume.clone();
+                if (observationWeight !== 1.0) {
+                    for (let i = 0; i < globalVolume.numVoxels; i++) {
+                        if (globalVolume.weights[i] > 0) {
+                            globalVolume.weights[i] = Math.min(globalVolume.maxTSDFWeight, observationWeight);
+                        }
+                    }
+                }
             } else {
-                globalVolume.fuseVolume(frameVolume);
+                globalVolume.fuseVolume(frameVolume, observationWeight);
             }
             latestVolumeKind = 'global';
             const globalDebug = summarizeVolume(globalVolume);
@@ -88,18 +94,20 @@ self.onmessage = (e) => {
                     skipped: !hadGlobal,
                     distances: globalVolume.distances,
                     weights: globalVolume.weights,
+                    voxelCenters: getObservedVoxelCenters(globalVolume),
                     debug: fuseDebug,
                 },
             });
             break;
 
         case 'extract_mesh':
+            const latestVolume = getLatestVolume();
             self.postMessage({
                 type: 'mesh_ready',
                 data: {
                     cameraIndex: activeCameraIndex,
                     source: latestVolumeKind,
-                    distances: getLatestVolume()?.distances ?? null,
+                    distances: latestVolume ? getMarchingCubesField(latestVolume, data?.weightThreshold ?? 0) : null,
                 },
             });
             break;
@@ -114,7 +122,6 @@ self.onmessage = (e) => {
 function initState(data = {}) {
     sceneType = data.type || 'sphere';
     noiseStd = data.noise || 0.02;
-    outlierRate = data.outliers || 0.05;
     observationWeight = data.observationWeight ?? 1.0;
     gsplatNoiseScale = data.gsplatNoise ?? 1.0;
     gaussianPoints = data.gaussianPoints ?? null;
@@ -209,7 +216,7 @@ function buildFrameTSDF() {
         mu: frameVolume?.mu,
         maxTSDFWeight: frameVolume?.maxTSDFWeight,
     });
-    if (framePoints?.length) frameVolume.fuse(framePoints);
+    if (framePoints?.length) frameVolume.buildFrame(framePoints);
     latestVolumeKind = 'frame';
 }
 
@@ -260,6 +267,71 @@ function countChangedVoxels(beforeVolume, afterVolume, epsilon = 1e-6) {
         }
     }
     return changed;
+}
+
+function getObservedVoxelCenters(volume) {
+    const centers = new Float32Array(summarizeVolume(volume).observedVoxels * 3);
+    let cursor = 0;
+    for (let idx = 0; idx < volume.numVoxels; idx++) {
+        if (volume.weights[idx] <= 0) continue;
+        const iz = Math.floor(idx / volume.sizeSq);
+        const iy = Math.floor((idx % volume.sizeSq) / volume.size);
+        const ix = idx % volume.size;
+        centers[cursor * 3] = (ix + 0.5) * volume.voxelSize - volume.extent;
+        centers[cursor * 3 + 1] = (iy + 0.5) * volume.voxelSize - volume.extent;
+        centers[cursor * 3 + 2] = (iz + 0.5) * volume.voxelSize - volume.extent;
+        cursor++;
+    }
+    return centers;
+}
+
+function getMarchingCubesField(volume, weightThreshold) {
+    if (weightThreshold <= 0) return volume.distances;
+
+    const keepMask = new Uint8Array(volume.numVoxels);
+    const size = volume.size;
+    const sizeSq = volume.sizeSq;
+
+    for (let z = 0; z < size - 1; z++) {
+        for (let y = 0; y < size - 1; y++) {
+            for (let x = 0; x < size - 1; x++) {
+                const i000 = x + y * size + z * sizeSq;
+                const i100 = i000 + 1;
+                const i010 = i000 + size;
+                const i110 = i010 + 1;
+                const i001 = i000 + sizeSq;
+                const i101 = i001 + 1;
+                const i011 = i001 + size;
+                const i111 = i011 + 1;
+
+                if (volume.weights[i000] < weightThreshold
+                    || volume.weights[i100] < weightThreshold
+                    || volume.weights[i010] < weightThreshold
+                    || volume.weights[i110] < weightThreshold
+                    || volume.weights[i001] < weightThreshold
+                    || volume.weights[i101] < weightThreshold
+                    || volume.weights[i011] < weightThreshold
+                    || volume.weights[i111] < weightThreshold) {
+                    continue;
+                }
+
+                keepMask[i000] = 1;
+                keepMask[i100] = 1;
+                keepMask[i010] = 1;
+                keepMask[i110] = 1;
+                keepMask[i001] = 1;
+                keepMask[i101] = 1;
+                keepMask[i011] = 1;
+                keepMask[i111] = 1;
+            }
+        }
+    }
+
+    const filtered = new Float32Array(volume.distances.length);
+    for (let i = 0; i < volume.numVoxels; i++) {
+        filtered[i] = keepMask[i] ? volume.distances[i] : 1.0;
+    }
+    return filtered;
 }
 
 /**
@@ -451,19 +523,6 @@ function backProjectDepthMap(camIdx, depthMap, normalMap) {
 
             points.push(pxWorld, pyWorld, pzWorld, nx, ny, nz, observationWeight);
         }
-    }
-
-    const totalPoints = points.length / 7;
-    const numOutliers = Math.floor(totalPoints * outlierRate);
-    for (let i = 0; i < numOutliers; i++) {
-        const ox = (Math.random() - 0.5) * 4;
-        const oy = (Math.random() - 0.5) * 4;
-        const oz = (Math.random() - 0.5) * 4;
-        let onx = Math.random() - 0.5;
-        let ony = Math.random() - 0.5;
-        let onz = Math.random() - 0.5;
-        const onLen = Math.sqrt(onx ** 2 + ony ** 2 + onz ** 2);
-        points.push(ox, oy, oz, onx / onLen, ony / onLen, onz / onLen, observationWeight);
     }
 
     return new Float32Array(points);

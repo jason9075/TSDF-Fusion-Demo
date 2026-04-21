@@ -115,9 +115,59 @@ export class TSDFVolume {
         }
     }
 
-    fuseVolume(other) {
+    buildFrame(points) {
+        this.reset();
+
+        const sdfSums = new Float32Array(this.numVoxels);
+        const hitCounts = new Uint16Array(this.numVoxels);
+        const numPoints = points.length / 7;
+
+        for (let i = 0; i < numPoints; i++) {
+            const px = points[i * 7];
+            const py = points[i * 7 + 1];
+            const pz = points[i * 7 + 2];
+            const nx = points[i * 7 + 3];
+            const ny = points[i * 7 + 4];
+            const nz = points[i * 7 + 5];
+
+            const nix = Math.floor((px + this.extent) / this.voxelSize);
+            const niy = Math.floor((py + this.extent) / this.voxelSize);
+            const niz = Math.floor((pz + this.extent) / this.voxelSize);
+
+            for (let dx = -this.range; dx <= this.range; dx++) {
+                for (let dy = -this.range; dy <= this.range; dy++) {
+                    for (let dz = -this.range; dz <= this.range; dz++) {
+                        const ix = nix + dx;
+                        const iy = niy + dy;
+                        const iz = niz + dz;
+
+                        if (ix < 0 || ix >= this.size || iy < 0 || iy >= this.size || iz < 0 || iz >= this.size) continue;
+
+                        const idx = ix + iy * this.size + iz * this.sizeSq;
+                        const vx = (ix + 0.5) * this.voxelSize - this.extent;
+                        const vy = (iy + 0.5) * this.voxelSize - this.extent;
+                        const vz = (iz + 0.5) * this.voxelSize - this.extent;
+                        const sdf = (vx - px) * nx + (vy - py) * ny + (vz - pz) * nz;
+
+                        if (Math.abs(sdf) <= this.mu) {
+                            sdfSums[idx] += sdf;
+                            hitCounts[idx] += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         for (let i = 0; i < this.numVoxels; i++) {
-            const incomingWeight = other.weights[i];
+            if (hitCounts[i] === 0) continue;
+            this.distances[i] = sdfSums[i] / hitCounts[i];
+            this.weights[i] = 1.0;
+        }
+    }
+
+    fuseVolume(other, incomingScale = 1.0) {
+        for (let i = 0; i < this.numVoxels; i++) {
+            const incomingWeight = other.weights[i] * incomingScale;
             if (incomingWeight <= 0) continue;
 
             const currentWeight = this.weights[i];
