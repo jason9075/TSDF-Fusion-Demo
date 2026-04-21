@@ -35,6 +35,7 @@ const params = {
     step3: () => {},
     step4: () => {},
     stopAutoPlay: () => stopAutoPlay(),
+    nextAutoStep: () => requestNextAutoStep(),
 };
 
 let scene, camera, renderer, controls;
@@ -48,6 +49,7 @@ let voxelTooltip = null;
 // Auto-play state
 const autoPlayState = { playing: false, paused: false };
 let resumeResolve = null;
+let stepAdvanceCredits = 0;
 const workerResolvers = new Map(); // type → resolve, for async worker communication
 
 // What the current step/play WANTS to show — independent of user toggle permissions.
@@ -66,6 +68,7 @@ let weightsBuffer = null;
 let pendingPoints = null;
 let activeDepthMap = null;
 let activeCameraIndex = 0;
+let activeObservationIndex = 0;
 let frameDistancesBuffer = null;
 let globalDistancesBuffer = null;
 let frameWeightsBuffer = null;
@@ -716,7 +719,9 @@ function setupGUI() {
         camera.position.copy(controls.target).add(offset);
         controls.update();
     });
-    gui.add(params, 'observationCount', 1, 800, 1).name('Observation Count');
+    gui.add(params, 'observationCount', 1, 800, 1).name('Observation Count').onChange(() => {
+        updatePlaybackInfo(autoPlayState.playing ? activeObservationIndex : 0, Math.max(1, Math.floor(params.observationCount)));
+    });
     gui.add(params, 'fastForward').name('Fast Forward');
     let playPauseCtrl;
     params.togglePlay = () => {
@@ -726,6 +731,7 @@ function setupGUI() {
     playPauseCtrl = gui.add(params, 'togglePlay').name('▶ Auto Play');
     window._playPauseCtrl = playPauseCtrl;
     gui.add(params, 'stopAutoPlay').name('■ Stop');
+    gui.add(params, 'nextAutoStep').name('⏭ Next Step');
 
     // Shared voxel grid resolution — must be identical for TSDF volume and MarchingCubes
     // because MC reads the TSDF distances array directly (marchingCubes.field.set(distances)).
@@ -855,6 +861,8 @@ function initWorker() {
             case 'ready':
                 workerNeedsInit = false;
                 highlightCamera(activeCameraIndex);
+                activeObservationIndex = 0;
+                updatePlaybackInfo(0, Math.max(1, Math.floor(params.observationCount)));
                 updateStatus('System Ready. Use Auto Play to start the reconstruction pipeline.');
                 break;
 
@@ -956,7 +964,10 @@ function initWorker() {
                 // Abort any in-progress auto-play
                 autoPlayState.playing = false;
                 autoPlayState.paused = false;
+                stepAdvanceCredits = 0;
+                activeObservationIndex = 0;
                 if (resumeResolve) { resumeResolve(); resumeResolve = null; }
+                updatePlaybackInfo(0, Math.max(1, Math.floor(params.observationCount)));
                 updatePlayButton();
                 break;
             }
@@ -1334,10 +1345,14 @@ async function waitWithStepProgress(step, baseDurationMs, startTime = performanc
     let adjustedStart = startTime;
     while (autoPlayState.playing) {
         if (autoPlayState.paused) {
-            const pauseStarted = performance.now();
-            await new Promise(r => { resumeResolve = r; });
-            adjustedStart += performance.now() - pauseStarted;
-            continue;
+            if (stepAdvanceCredits > 0) {
+                stepAdvanceCredits -= 1;
+            } else {
+                const pauseStarted = performance.now();
+                await new Promise(r => { resumeResolve = r; });
+                adjustedStart += performance.now() - pauseStarted;
+                continue;
+            }
         }
 
         const durationMs = params.fastForward ? 0 : baseDurationMs;
@@ -1544,6 +1559,10 @@ function waitForWorkerMsg(type) {
 /** If paused, waits until resume is clicked. */
 function checkPause() {
     if (!autoPlayState.paused) return Promise.resolve();
+    if (stepAdvanceCredits > 0) {
+        stepAdvanceCredits -= 1;
+        return Promise.resolve();
+    }
     return new Promise(r => { resumeResolve = r; });
 }
 
@@ -1573,11 +1592,21 @@ function togglePause() {
         resumeResolve();
         resumeResolve = null;
     }
+    if (!autoPlayState.paused) stepAdvanceCredits = 0;
     updatePlayButton();
 }
 
 function stopAutoPlay() {
     resetDemo();
+}
+
+function requestNextAutoStep() {
+    if (!autoPlayState.playing || !autoPlayState.paused) return;
+    stepAdvanceCredits += 1;
+    if (resumeResolve) {
+        resumeResolve();
+        resumeResolve = null;
+    }
 }
 
 async function startAutoPlay() {
@@ -1609,6 +1638,8 @@ async function startAutoPlay() {
         if (!autoPlayState.playing) break;
         const c = observationIndex % CAM_COUNT_MAIN;
         activeCameraIndex = c;
+        activeObservationIndex = observationIndex + 1;
+        updatePlaybackInfo(activeObservationIndex, totalObservations);
 
         // ── Step 1: Acquire Depth ────────────────────────────────────────────
         setStepProgress(1, 0, { nextStep: 2, completedStep: 0 });
@@ -1737,6 +1768,9 @@ async function startAutoPlay() {
     }
 
     autoPlayState.playing = false;
+    stepAdvanceCredits = 0;
+    activeObservationIndex = 0;
+    updatePlaybackInfo(0, Math.max(1, Math.floor(params.observationCount)));
     updatePlayButton();
 }
 
@@ -1760,7 +1794,13 @@ function sendInitToWorker() {
 }
 
 function updateStatus(msg) {
-    document.getElementById('status').textContent = msg;
+    document.getElementById('status-message').textContent = msg;
+}
+
+function updatePlaybackInfo(currentObservation, totalObservations) {
+    const info = document.getElementById('playback-info');
+    if (!info) return;
+    info.textContent = `Observation ${currentObservation} / ${totalObservations}`;
 }
 
 function onWindowResize() {
