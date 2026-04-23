@@ -49,7 +49,8 @@ body {
 header {
     position: absolute;
     top: 2rem;
-    left: 2rem;
+    left: 50%;
+    transform: translateX(-50%);
     z-index: 10;
     background: var(--card-bg);
     padding: 1.5rem;
@@ -58,6 +59,16 @@ header {
     border: 1px solid rgba(255, 255, 255, 0.1);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
     pointer-events: none;
+    text-align: center;
+}
+
+.github-ribbon {
+    position: absolute;
+    top: 0;
+    left: 0;
+    border: 0;
+    z-index: 1000;
+    pointer-events: auto;
 }
 
 h1 {
